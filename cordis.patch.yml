@@ -1,0 +1,10 @@
+# dsh-subagent-profile bundle patch: inserts the dual-face plugin row into the
+# profile roster. The node half (exports ".") runs in the host process — it
+# registers the dispatch tool, the profile provider, the subagent-profiles
+# service, and the /subagent-profiles/* loopback HTTP routes; the `dsh.client`
+# declaration in package.json makes the browser half (exports "./client", served
+# at /plugins/<id>/client.js) load in the web GUI as the settings page and the
+# dispatch tool-call card.
+- insert:
+    - id: subagent-profile
+      name: dsh-subagent-profile

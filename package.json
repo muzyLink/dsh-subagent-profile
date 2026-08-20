@@ -1,0 +1,59 @@
+{
+  "name": "dsh-subagent-profile",
+  "version": "0.1.0",
+  "description": "Dispatch one-shot subtasks to derived subagents with per-task overrides (preset/model/provider/reasoningEffort/persona/tool whitelist), a runtime-derived cost guard, a subagent-profiles service, observability metadata, and a web-GUI settings page plus a dispatch tool-call card.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muzyLink/dsh-subagent-profile.git"
+  },
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "presets",
+    "README.md",
+    "README.zh.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-subagent": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.8"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-subagent": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.8"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "subagent",
+    "dispatch",
+    "profiles"
+  ],
+  "license": "MIT"
+}

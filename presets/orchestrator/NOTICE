@@ -1,0 +1,3 @@
+agent.cordis.yml 改编自 DeepSeek Harness 内置 standard preset（MIT）。
+仅 persona 段改写为「主协调 Agent」身份；其余行与原 standard 预设一致。
+原始 DeepSeek 版权与 MIT 许可声明见开源仓库。

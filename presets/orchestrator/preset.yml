@@ -1,0 +1,2 @@
+name: 编排者模式
+description: 主 Agent 协调模式：把复杂任务拆解后，用 dispatch / subagent / workflow 按场景委派给合适的子 Agent（预设/模型/推理强度/工具白名单可逐个覆盖），收集并整合结果。适合需要多路并行、按场景配子 Agent 的复杂任务。
