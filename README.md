@@ -6,7 +6,7 @@
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
   <img alt="Version: 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue.svg" />
   <img alt="DSH: 0.1.0-rc.8" src="https://img.shields.io/badge/DSH-0.1.0--rc.8-blue.svg" />
-  ![Node](https://img.shields.io/badge/node-%5E22.19.0%20%7C%7C%20%3E%3D24-green.svg)
+  <img alt="Node" src="https://img.shields.io/badge/node-%5E22.19.0%20%7C%7C%20%3E%3D24-green.svg" />
 </div>
 
 <div align="center">English · <a href="README.zh.md">中文</a></div>
