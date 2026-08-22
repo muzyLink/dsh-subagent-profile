@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-profile",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Dispatch one-shot subtasks to derived subagents with per-task overrides (preset/model/provider/reasoningEffort/persona/tool whitelist), a runtime-derived cost guard, a subagent-profiles service, observability metadata, and a web-GUI settings page plus a dispatch tool-call card.",
   "repository": {
     "type": "git",
