@@ -5,7 +5,7 @@
   <b style="font-size: 1.15em;">Subagent dispatch, profiled — the right agent for the right task (preset / model / reasoning effort)</b><br /><br />
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
   <img alt="npm" src="https://img.shields.io/npm/v/dsh-subagent-profile.svg" />
-  <img alt="DSH" src="https://img.shields.io/badge/DSH-0.1.0--rc.6%20~%20rc.8-blue.svg" />
+  <img alt="DSH" src="https://img.shields.io/badge/DSH-0.1.0--rc.6%20~%200.1.1--rc.2-blue.svg" />
 </div>
 
 <div align="center">English · <a href="README.zh.md">中文</a></div>
