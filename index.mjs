@@ -8,7 +8,7 @@
 // in README.md.
 
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-subagent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { textFrom, stopReasonError, withPartialText } from './lib/pure.mjs';
+import { textFrom, stopReasonError, withPartialText, sanitizeProfile, MAX_TOKENS, MAX_DEPTH, GUIDANCE_PREFIX } from './lib/pure.mjs';
 import { readResult } from './lib/shims.mjs';
 
 export const name = 'dsh-subagent-profile';
@@ -196,11 +196,8 @@ function persistEnabled(enabled) {
 
 // --- module-level helpers (kept inline; the packages do not export them) ---
 
-// F5: conservative delegation caps for maxTokens / maxDepth.
-const MAX_TOKENS = 65536;
-const MAX_DEPTH = 3;
-
-// F5: runtime-derived cost guard. Reads the optional `llm` service (undefined =>
+// F5: runtime-derived cost guard. (MAX_TOKENS / MAX_DEPTH are imported from
+// lib/pure.mjs — the single source of truth shared with sanitizeProfile.) Reads the optional `llm` service (undefined =>
 // guard skipped) and validates provider / model / reasoningEffort against the
 // live provider directory, plus the maxTokens/maxDepth caps. Used by both the
 // provider's authoritative check and the dispatch tool's pre-check.
@@ -410,32 +407,72 @@ export async function apply(ctx) {
   // add/remove HTTP routes rewrite the file. Persistence is an enhancement, not
   // a hard dependency: any failure only warns and the builtin seeds work.
   const profilesFile = join(dshHome(), 'subagent-profiles.json');
+  // V2 migration switch (SPEC §7.3 / §12.1): whether the cost guard may fail-open
+  // when the `llm` service is absent. Defaults to true (legacy-compatible) so an
+  // old deployment keeps its fail-open behavior until it explicitly opts out;
+  // a v2 envelope carries its own stored value. Task 4 (cost-guard narrow) reads
+  // this flag.
+  let allowFailOpen = true;
   function loadProfiles() {
     if (!existsSync(profilesFile)) return;
     try {
       const parsed = JSON.parse(readFileSync(profilesFile, 'utf8'));
-      if (!Array.isArray(parsed)) return;
+      // Two file shapes (SPEC §12.1): v1 = a bare array; v2 = { version:2,
+      // profiles:[...], allowFailOpen:<bool> }.
+      let entries;
+      let version;
+      if (Array.isArray(parsed)) {
+        entries = parsed;
+        version = 1;
+      } else if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.profiles)) {
+        entries = parsed.profiles;
+        version = parsed.version ?? 2;
+        // v2 缺 allowFailOpen 字段时按 fail-open 兼容（显式 false 才关闭）；
+        // 全新部署默认语义由 Task 4 定夺。
+        allowFailOpen = parsed.allowFailOpen !== false;
+      } else {
+        ctx.logger.warn('[dsh-subagent-profile] persisted profile file has an unrecognized shape; ignoring');
+        return;
+      }
+      // v1 (or an unversioned array): migrate in memory, keep fail-open compat.
+      if (version !== 2) {
+        allowFailOpen = true;
+        ctx.logger.warn('[dsh-subagent-profile] v1 数据：fail-open 兼容模式');
+      }
       let loaded = 0;
-      for (const entry of parsed) {
-        if (!entry || typeof entry.id !== 'string' || entry.id.length === 0) continue;
-        if (entry.deleted === true) {
-          if (entry.builtin === true) {
-            profiles.delete(entry.id);
-            deletedBuiltins.add(entry.id);
+      let skipped = 0;
+      for (const raw of entries) {
+        if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || raw.id.length === 0) {
+          skipped++;
+          ctx.logger.warn('[dsh-subagent-profile] skipping malformed profile entry:', raw === null ? String(raw) : typeof raw);
+          continue;
+        }
+        // Per-entry sanitize (strict=false): over-limit fields are dropped
+        // (field removed) + warned; an over-length persona is KEPT + warned
+        // (never silently truncated). A bad entry is skipped (fail-soft).
+        const { clean, warnings } = sanitizeProfile(raw, { strict: false });
+        for (const warning of warnings) {
+          ctx.logger.warn(`[dsh-subagent-profile] profile "${raw.id}" ${warning.field} 被跳过或提示：${warning.reason}`);
+        }
+        if (clean.deleted === true) {
+          if (clean.builtin === true) {
+            profiles.delete(clean.id);
+            deletedBuiltins.add(clean.id);
           }
           continue;
         }
-        const existing = profiles.get(entry.id);
+        const existing = profiles.get(clean.id);
         if (existing !== undefined && existing.builtin === true) {
-          profiles.set(entry.id, { ...entry, builtin: true, persisted: true });
+          profiles.set(clean.id, { ...clean, builtin: true, persisted: true });
         } else {
-          profiles.set(entry.id, { ...entry, persisted: true });
+          profiles.set(clean.id, { ...clean, persisted: true });
         }
         loaded++;
       }
       // Silent success: report how many persisted profiles came in (skipped
       // when none — a missing/empty file is the normal first boot).
       if (loaded > 0) ctx.logger.info(`[dsh-subagent-profile] loaded ${loaded} persisted profile(s)`);
+      if (skipped > 0) ctx.logger.warn(`[dsh-subagent-profile] skipped ${skipped} malformed profile entry(ies)`);
     } catch (error) {
       ctx.logger.warn('[dsh-subagent-profile] persisted profile load failed:', error instanceof Error ? error.message : String(error));
     }
@@ -457,25 +494,40 @@ export async function apply(ctx) {
     ctx.logger.warn('[dsh-subagent-profile] preset sync failed:', error instanceof Error ? error.message : String(error));
   }
 
-  /** Persist every `persisted: true` profile plus builtin-delete tombstones — fail-soft. */
+  /**
+   * Persist every `persisted: true` profile plus builtin-delete tombstones.
+   * Atomic write (SPEC §12.2): write `<profilesFile>.tmp` in the same directory,
+   * then `renameSync` over the target (a crash leaves the old file intact, never
+   * a truncated one). Fail-visible (D5/B1): a failure does NOT throw and does NOT
+   * roll back the in-memory `profiles` Map — it returns `{ persisted: false }` so
+   * the caller can signal "已保存但未持久化" while the in-memory state keeps
+   * driving this process. Always writes the v2 envelope shape.
+   */
   function persistProfiles() {
+    const entries = [];
+    for (const profile of profiles.values()) {
+      if (profile.persisted !== true) continue;
+      const clean = {};
+      for (const [key, value] of Object.entries(profile)) {
+        if (value === undefined || key === 'persisted') continue;
+        clean[key] = value;
+      }
+      entries.push(clean);
+    }
+    for (const id of deletedBuiltins) {
+      entries.push({ id, builtin: true, deleted: true });
+    }
+    const payload = { version: 2, profiles: entries, allowFailOpen };
+    const tmp = `${profilesFile}.tmp`;
     try {
-      const entries = [];
-      for (const profile of profiles.values()) {
-        if (profile.persisted !== true) continue;
-        const clean = {};
-        for (const [key, value] of Object.entries(profile)) {
-          if (value === undefined || key === 'persisted') continue;
-          clean[key] = value;
-        }
-        entries.push(clean);
-      }
-      for (const id of deletedBuiltins) {
-        entries.push({ id, builtin: true, deleted: true });
-      }
-      writeFileSync(profilesFile, JSON.stringify(entries, null, 2), 'utf8');
+      writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      renameSync(tmp, profilesFile);
+      return { persisted: true };
     } catch (error) {
+      // Best-effort cleanup of the partial tmp file (rename never ran).
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
       ctx.logger.warn('[dsh-subagent-profile] persisted profile write failed:', error instanceof Error ? error.message : String(error));
+      return { persisted: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -502,6 +554,16 @@ export async function apply(ctx) {
         try { resolve(data === '' ? {} : JSON.parse(data)); } catch { reject(new Error('请求体不是合法 JSON')); }
       });
       req.on('error', reject);
+    });
+    // D5/B1 write-failure contract: the write routes return HTTP 200 with
+    // `persisted` always present; when the disk write failed, persistWarning
+    // explains "已保存但未持久化" (in-memory state drives this process, the
+    // disk did not update). The client renders that as the amber warning.
+    const persistOk = (res, payload, persist) => json(res, 200, {
+      ok: true,
+      ...payload,
+      persisted: persist.persisted,
+      ...(persist.persisted ? {} : { persistWarning: '已保存但未持久化' }),
     });
     const listClean = () => [...profiles.values()].map((profile) => {
       const clean = {};
@@ -627,32 +689,44 @@ export async function apply(ctx) {
           if (typeof profile.id !== 'string' || profile.id.length === 0) {
             return json(res, 400, { ok: false, error: 'subagent-profiles: profile id must be a non-empty string' });
           }
-          const existing = profiles.get(profile.id);
-          const seed = BUILTIN_SEEDS.find((s) => s.id === profile.id);
+          // 写路径上限（SPEC §7.2）：strict=true —— 超限/非法字段直接 400 拒绝，
+          // 与 loadProfiles（strict=false 迁移宽松读取）的行为区分。列被拒字段与中文原因。
+          const { clean, warnings } = sanitizeProfile(profile, { strict: true });
+          if (warnings.length > 0) {
+            const detail = warnings.map((w) => `${w.field}：${w.reason}`).join('；');
+            return json(res, 400, { ok: false, error: `写入被拒绝：${detail}` });
+          }
+          const hadToolFilter = profile.toolFilter !== undefined;
+          const existing = profiles.get(clean.id);
+          const seed = BUILTIN_SEEDS.find((s) => s.id === clean.id);
           const isBuiltin = (existing !== undefined && existing.builtin === true) || seed !== undefined;
           // Merge (not replace): start from the existing profile — or its seed
           // when it was deleted — so fields not present in the form (e.g. a
-          // builtin's persona/preset) survive an edit or a re-add.
-          const clean = { ...(existing ?? seed ?? {}) };
-          clean.id = profile.id;
+          // builtin's persona/preset) survive an edit or a re-add. `clean` is the
+          // sanitized request body, so a field absent from the request is absent
+          // from clean and the existing value is preserved (merge semantics).
+          const merged = { ...(existing ?? seed ?? {}) };
+          merged.id = clean.id;
           for (const key of ['name', 'description', 'preset', 'provider', 'model', 'reasoningEffort', 'persona', 'enabled']) {
-            if (profile[key] === undefined) continue;       // 未传：保留 existing 原值
-            if (profile[key] === '' || profile[key] === null) { delete clean[key]; continue; }  // 空：清除字段
-            clean[key] = profile[key];
+            if (clean[key] === undefined) continue;       // 未传：保留 existing 原值
+            if (clean[key] === '' || clean[key] === null) { delete merged[key]; continue; }  // 空：清除字段
+            merged[key] = clean[key];
           }
-          // toolFilter 特殊处理：前端改成多选下拉后总是传数组，空数组 = 清除
-          if (profile.toolFilter !== undefined) {
-            const tf = profile.toolFilter;
-            const allow = Array.isArray(tf.allow) ? tf.allow.map((s) => String(s).trim()).filter(Boolean) : [];
-            const deny = Array.isArray(tf.deny) ? tf.deny.map((s) => String(s).trim()).filter(Boolean) : [];
-            if (allow.length > 0 || deny.length > 0) clean.toolFilter = { ...(allow.length > 0 ? { allow } : {}), ...(deny.length > 0 ? { deny } : {}) };
-            else delete clean.toolFilter;
+          // toolFilter 特殊处理：前端改成多选下拉后总是传数组，空数组 = 清除。
+          // 请求未传 toolFilter 时保留 existing 原值（merge 语义）；传了但被
+          // sanitize 归一为空（如 allow/deny 均空）则清除。
+          if (hadToolFilter) {
+            const tf = clean.toolFilter;
+            if (tf !== undefined && ((Array.isArray(tf.allow) && tf.allow.length > 0) || (Array.isArray(tf.deny) && tf.deny.length > 0))) {
+              merged.toolFilter = { ...(Array.isArray(tf.allow) && tf.allow.length > 0 ? { allow: tf.allow } : {}), ...(Array.isArray(tf.deny) && tf.deny.length > 0 ? { deny: tf.deny } : {}) };
+            } else {
+              delete merged.toolFilter;
+            }
           }
-          if (clean.enabled !== undefined) clean.enabled = clean.enabled === false ? false : true;
-          profiles.set(profile.id, { ...clean, ...(isBuiltin ? { builtin: true } : {}), persisted: true });
-          deletedBuiltins.delete(profile.id);
-          persistProfiles();
-          return json(res, 200, { ok: true, id: profile.id });
+          if (merged.enabled !== undefined) merged.enabled = merged.enabled === false ? false : true;
+          profiles.set(merged.id, { ...merged, ...(isBuiltin ? { builtin: true } : {}), persisted: true });
+          deletedBuiltins.delete(merged.id);
+          return persistOk(res, { id: merged.id }, persistProfiles());
         }
         if (req.method === 'POST' && sub === '/remove') {
           const body = await readBody(req);
@@ -663,8 +737,7 @@ export async function apply(ctx) {
           }
           profiles.delete(id);
           if (existing.builtin === true) deletedBuiltins.add(id);
-          persistProfiles();
-          return json(res, 200, { ok: true, id });
+          return persistOk(res, { id }, persistProfiles());
         }
         if (req.method === 'POST' && sub === '/reset') {
           const body = await readBody(req);
@@ -675,16 +748,14 @@ export async function apply(ctx) {
           }
           profiles.set(id, { ...seed });
           deletedBuiltins.delete(id);
-          persistProfiles();
-          return json(res, 200, { ok: true, id });
+          return persistOk(res, { id }, persistProfiles());
         }
         if (req.method === 'POST' && sub === '/reset-all') {
           for (const seed of BUILTIN_SEEDS) {
             profiles.set(seed.id, { ...seed });
             deletedBuiltins.delete(seed.id);
           }
-          persistProfiles();
-          return json(res, 200, { ok: true, count: BUILTIN_SEEDS.length });
+          return persistOk(res, { count: BUILTIN_SEEDS.length }, persistProfiles());
         }
         if (req.method === 'POST' && sub === '/set-profile-enabled') {
           const body = await readBody(req);
@@ -697,12 +768,13 @@ export async function apply(ctx) {
           // Persist unconditionally (not just for builtins): a runtime-registered
           // profile's enable/disable must also survive a restart.
           existing.persisted = true;
-          persistProfiles();
-          return json(res, 200, { ok: true, id, enabled: existing.enabled });
+          return persistOk(res, { id, enabled: existing.enabled }, persistProfiles());
         }
         json(res, 404, { ok: false, error: `未知路由 ${sub}` });
       } catch (error) {
-        json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        // 通用 500 不回显内部错误信息（防泄漏），详情只进宿主日志。
+        ctx.logger.error('[dsh-subagent-profile] settings route error:', error instanceof Error ? (error.stack ?? error.message) : String(error));
+        json(res, 500, { ok: false, error: '内部错误，详情见宿主日志' });
       }
     };
     scope.effect(() => {
@@ -749,7 +821,12 @@ export async function apply(ctx) {
         if (!enabled) return '';
         const rows = [...profiles.values()]
           .filter((p) => p.enabled !== false)
-          .map((p) => `- ${p.id}: ${p.description}${p.preset !== undefined ? ` (preset: ${p.preset})` : ''}`);
+          .map((p) => {
+            // 引号引用：description 套引号；为空时显示占位符（不套引号）。压平
+            // 在存储层完成（sanitizeProfile），此处仅负责显示层包裹。
+            const desc = typeof p.description === 'string' && p.description.length > 0 ? `"${p.description}"` : '(无描述)';
+            return `- ${p.id}: ${desc}${p.preset !== undefined ? ` (preset: ${p.preset})` : ''}`;
+          });
         return rows.length === 0 ? '' : `Available dispatch profiles (dispatch.profile):\n${rows.join('\n')}`;
       }
     });
@@ -874,9 +951,16 @@ export async function apply(ctx) {
           if (systemPrompt !== undefined) {
             systemPrompt.context({ name: 'subagent:delegation', order: 120, text: DELEGATION_CONTEXT });
           }
-          // ④ Persona shadow (overrides deployment:persona at order 0).
+          // ④ Persona shadow (overrides deployment:persona at order 0). The
+          // guidance marker is prefixed when the persona is non-empty (双防线):
+          // the injected text is `${GUIDANCE_PREFIX}${persona}`, exactly the
+          // length the sanitizeProfile cap validates (wrappedLength).
           if (profile.persona !== undefined && systemPrompt !== undefined) {
-            systemPrompt.section({ name: 'deployment:persona', order: 0, text: profile.persona });
+            systemPrompt.section({
+              name: 'deployment:persona',
+              order: 0,
+              text: profile.persona.length > 0 ? `${GUIDANCE_PREFIX}${profile.persona}` : profile.persona,
+            });
           }
           // ⑤ Reasoning-effort injection into every child request.
           if (profile.reasoningEffort !== undefined) {

@@ -98,6 +98,9 @@ test('systemPrompt.section: registers dispatch:profiles and orchestrator:mode', 
   const text = profiles.text();
   assert.ok(text.length > 0, 'dispatch:profiles text() must be non-empty when enabled');
   assert.match(text, /Available dispatch profiles/);
+  // 引号引用（V2 §7.2）：description 在显示行被双引号包裹。
+  assert.match(text, /swap-standard: "切换到 standard 预设的完整编码工具集。/);
+  assert.match(text, /researcher: "关闭深度推理省 token，继承父工具。/);
 
   const orchestrator = records.sectionCalls.find((s) => s.name === 'orchestrator:mode');
   assert.ok(orchestrator, 'systemPrompt.section must register orchestrator:mode');
