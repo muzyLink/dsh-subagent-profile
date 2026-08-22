@@ -4,7 +4,7 @@
 <div align="center">
   <b style="font-size: 1.15em;">子 Agent 派发方案化插件 —— 用对的人（预设 / 模型 / 推理强度）干对的事</b><br /><br />
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
-  <img alt="Version: 0.1.0" src="https://img.shields.io/badge/version-0.1.0-blue.svg" />
+  <img alt="npm" src="https://img.shields.io/npm/v/dsh-subagent-profile.svg" />
   <img alt="DSH" src="https://img.shields.io/badge/DSH-0.1.0--rc.6%20~%20rc.8-blue.svg" />
 </div>
 
@@ -90,6 +90,12 @@ dispatch(
 
 - **后台**一次性派发需要加载 `@deepseek-ai/dsh-jobs` 与 `@deepseek-ai/dsh-tool-jobs`，否则报「background jobs unavailable」。
 - **可续跑**模式走 DSH 标准组合路径，因此 `preset` 换用与 `reasoningEffort` 会被忽略（继承父预设、使用默认推理强度）。
+
+## 贡献
+
+发现 Bug 或有新想法?欢迎[提 Issue](https://github.com/muzyLink/dsh-subagent-profile/issues)或提交 Pull Request,任何形式的贡献都欢迎。
+
+如果这个插件帮到了你,欢迎在 GitHub 上点个 ⭐,让更多人看到它。
 
 ## 致谢
 
