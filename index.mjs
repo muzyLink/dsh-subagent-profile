@@ -21,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-subagent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { textFrom, stopReasonError, withPartialText, sanitizeProfile, GUIDANCE_PREFIX, assertHardLimits, computeContinuableAllow } from './lib/pure.mjs';
+import { textFrom, stopReasonError, withPartialText, sanitizeProfile, GUIDANCE_PREFIX, assertHardLimits, computeContinuableAllow, pruneBlocks, assertResultSchemaConsistency } from './lib/pure.mjs';
 import { readResult } from './lib/shims.mjs';
 
 export const name = 'dsh-subagent-profile';
@@ -284,7 +284,11 @@ async function assertCostGuard(parent, profile, allowFailOpen, logger) {
 // observability metadata the foreground path reports. Non-completed stop reasons
 // become failed (aborted => killed, shipped vocabulary) with partial output
 // attached; hard failures never reject the job.
-async function settleStart(start, signal, meta) {
+// `prune` is the result-recycle pre-clipper (§8.2): the caller (dispatch
+// execute) injects a closure that calls the host toolResultPruner.pruneContent
+// before textFrom; defaulting to identity keeps the background path safe when no
+// pruner is available.
+async function settleStart(start, signal, meta, prune = (blocks) => blocks) {
   let run;
   try {
     run = await start;
@@ -293,7 +297,7 @@ async function settleStart(start, signal, meta) {
     if (failure !== undefined) {
       return { status: result.stopReason === 'aborted' ? 'killed' : 'failed', detail: withPartialText(failure, result.output), ...meta };
     }
-    return { status: 'completed', output: textFrom(result.output), ...meta };
+    return { status: 'completed', output: textFrom(prune(result.output)), ...meta };
   } catch (error) {
     return signal.aborted ? { status: 'killed', ...meta } : { status: 'failed', detail: String(error), ...meta };
   } finally {
@@ -847,11 +851,53 @@ export async function apply(ctx) {
   // section `text` accepts a function, as the shipped tool-subagent proves).
   const pluginSystemPrompt = ctx.get('systemPrompt');
   if (pluginSystemPrompt !== undefined) {
+    // §8.1 系统提示门控：两段 profile-mode section **只在当前席 Agent 是编排者
+    // 预设（orchestrator）**时注入，从而消除从 standard/code/minimal 等不派发
+    // 会话上的每请求固定泄漏。
+    //
+    // —— 门控判据（以源码为准确认，见 test/README.md）——
+    // 主判据（preset 特征）：`composedPreset(agentCtx) === 'orchestrator'`。这是
+    // 判别「是否编排者会话」的可靠信号：dispatch 工具由本 host 行注册、经
+    // dsh-tools `schemas(scope)` 的 global 继承起点对**每个** agent 恒可见，因此
+    // 「schemas(agent) 含 dispatch」在宿主架构下恒真，**不能**作为主判据（规格
+    // 评审意见：schemas 判据降为否决）。
+    // 否决（防御，防假阳性）：若 `schemas(agent)` **明确不含** dispatch → 必空。
+    // 生产环境恒含 dispatch（host-global），此否决在正常路径不触发；它只防御任何
+    // 让 dispatch 从 agent 视野消失的宿主行为。
+    // 回退：拿不到 agentPresets（composedPreset 不可用）时无法判别当前 Agent 的
+    // 组成，保守不注入（无泄漏风险）。
+    //
+    // section.text(context) 由宿主以 assembleContextFor(agent, signal) =
+    // { agent, scope: agent, signal } 调用（@deepseek-ai/dsh-agent），因此 text()
+    // 能拿到 context.agent；Agent 实例带 .ctx（dsh-agent-presets 的
+    // composedPreset(agentCtx) 正以 agentCtx 作为期望入参），故主判据优先取
+    // context.agent.ctx。
+    const sectionGatePasses = (context) => {
+      if (!enabled) return false;
+      // 否决（防御性）：schemas(agent) 明确不含 dispatch → 必空。
+      if (context !== undefined && context.agent !== undefined) {
+        const schemas = ctx.tools.schemas(context.agent);
+        if (Array.isArray(schemas) && !schemas.some((s) => s && s.name === 'dispatch')) {
+          return false;
+        }
+      }
+      // 主判据：preset 特征 —— composedPreset(agentCtx) === 'orchestrator'。
+      const agentPresets = ctx.get('agentPresets');
+      if (agentPresets !== undefined && typeof agentPresets.composedPreset === 'function') {
+        const agentCtx = context !== undefined && context.agent !== undefined && context.agent.ctx !== undefined
+          ? context.agent.ctx
+          : ctx;
+        try { return agentPresets.composedPreset(agentCtx) === 'orchestrator'; }
+        catch { return false; }
+      }
+      // 无 agentPresets → 无法判别 → 保守不注入。
+      return false;
+    };
     pluginSystemPrompt.section({
       name: 'dispatch:profiles',
       order: 116.5,
-      text: () => {
-        if (!enabled) return '';
+      text: (context) => {
+        if (!sectionGatePasses(context)) return '';
         const rows = [...profiles.values()]
           .filter((p) => p.enabled !== false)
           .map((p) => {
@@ -860,15 +906,24 @@ export async function apply(ctx) {
             const desc = typeof p.description === 'string' && p.description.length > 0 ? `"${p.description}"` : '(无描述)';
             return `- ${p.id}: ${desc}${p.preset !== undefined ? ` (preset: ${p.preset})` : ''}`;
           });
-        return rows.length === 0 ? '' : `Available dispatch profiles (dispatch.profile):\n${rows.join('\n')}`;
+        if (rows.length === 0) return '';
+        // §8.3 一行行为规则（进门控 profiles section，非常开 persona）：用相对
+        // 锚点降低「几分钟内可自查完的小任务」被派发的概率（SPEC §8.1 残留分歧
+        // 已定：行为规则注入点取门控 profiles section）。
+        const note = '- 别把 1-2 步即可自查/可搜完的小事委派出去 —— 几分钟内能自查完的直接做。';
+        return `Available dispatch profiles (dispatch.profile):\n${rows.join('\n')}\n${note}`;
       }
     });
     // Announce the self-installed orchestrator preset so the current agent
-    // knows the mode exists and can point the user to it.
+    // knows the mode exists and can point the user to it. §8.1: gated the same
+    // way — only a dispatch-capable agent sees it.
     pluginSystemPrompt.section({
       name: 'orchestrator:mode',
       order: 117,
-      text: '本机已安装 dsh-subagent-profile 插件的「编排者模式」agent preset：新建会话的预设选择器中可选「编排者模式」。该模式把 Agent 定位为主协调者——拆解任务后按场景用 dispatch（内置 swap-standard=标准编码、researcher=调研检索，可在「子 Agent 方案」设置页自定义）与 subagent/subagent_fork/workflow 委派给子 Agent，再整合结果。preset 文件由插件维护于 ~/.dsh/.agent-presets，安装/升级时自动同步；用户提到「编排者模式 / orchestrator / 主协调模式」时即指本预设，请据此协作。'
+      text: (context) => {
+        if (!sectionGatePasses(context)) return '';
+        return '本机已安装 dsh-subagent-profile 插件的「编排者模式」agent preset：新建会话的预设选择器中可选「编排者模式」。该模式把 Agent 定位为主协调者——拆解任务后按场景用 dispatch（内置 swap-standard=标准编码、researcher=调研检索，可在「子 Agent 方案」设置页自定义）与 subagent/subagent_fork/workflow 委派给子 Agent，再整合结果。preset 文件由插件维护于 ~/.dsh/.agent-presets，安装/升级时自动同步；用户提到「编排者模式 / orchestrator / 主协调模式」时即指本预设，请据此协作。';
+      }
     });
   }
 
@@ -1072,7 +1127,7 @@ export async function apply(ctx) {
   //    runtime (disappearing from the model's tool list) without a restart.
   const dispatchTool = defineTool({
     name: 'dispatch',
-    description: 'Dispatch a subtask to a derived subagent, optionally overriding its preset, model, provider, reasoning effort, persona, tool whitelist, token budget, or recursion depth. Foreground waits for the result; run_in_background: true starts a background job (single turn); continuable: true starts a durable subagent whose conversation stays available for later turns via the send_message tool.',
+    description: 'Dispatch a subtask to a derived subagent, optionally overriding its preset, model, provider, reasoning effort, persona, tool whitelist, token budget, or recursion depth. Foreground waits for the result; run_in_background: true starts a background job (single turn); continuable: true starts a durable subagent whose conversation stays available for later turns via the send_message tool. 前瞻：continuable 模式忽略 preset 换用与 reasoningEffort（结果以 ignored 提示）。',
     parameters: {
       profile: { type: 'string', description: 'Optional profile id from the profile registry (built-ins: swap-standard, researcher, plus any you define in the settings page); omit to inherit the parent preset and tools as-is.' },
       preset: { type: 'string', description: 'Explicit target preset override; must be a system-trust preset of this runtime.' },
@@ -1096,6 +1151,10 @@ export async function apply(ctx) {
       maxDepth: { type: 'number', description: 'Absolute delegation-depth cap for this child.' },
       run_in_background: { type: 'boolean', description: '异步 one-shot：走 jobs.start 包 start()，返回 jobId；仍单轮即弃，非 continuable' },
       continuable: { type: 'boolean', description: 'Start a durable continuable subagent instead of a one-shot: returns a subagentId immediately and keeps the child conversation available for later turns via the send_message tool. Defaults to false.' },
+      // §8.2 信封模式 = opt-in（仅「中段即交付物」的任务用）。首切片**仅预留**：
+      // 工具 schema 暴露此参数作字段契约，execute 当前不消费它（结构化信封回收
+      // 在 V2.0-中期启用）。见 execute 内注释。
+      envelope: { type: 'boolean', description: '预留：结构化信封回收（V2.0 中期启用，当前不生效）' },
       prompt: { type: 'string', required: true, description: 'The complete, self-contained task for the child (it does not see this conversation).' }
     },
     output: {
@@ -1103,6 +1162,10 @@ export async function apply(ctx) {
         // D: observability metadata on every result. OneOf covers the
         // background variant (kind/jobId) and the foreground variant (output),
         // both closed and both carrying the effective delegation values.
+        // R1: `ignored` was added to ALL three branches (with the shared `preset`
+        // / `provider` / `model` / `reasoningEffort` / `profile`), keeping the
+        // closed oneOf consistent — assertResultSchemaConsistency(dispatchTool
+        // .output.schema) in apply() fires if any 分支 忘补该字段.
         oneOf: [
           {
             type: 'object',
@@ -1114,7 +1177,8 @@ export async function apply(ctx) {
               preset: { type: 'string' },
               provider: { type: 'string' },
               model: { type: 'string' },
-              reasoningEffort: { type: 'string' }
+              reasoningEffort: { type: 'string' },
+              ignored: { type: 'array', items: { type: 'string' } }
             }
           },
           {
@@ -1127,7 +1191,8 @@ export async function apply(ctx) {
               preset: { type: 'string' },
               provider: { type: 'string' },
               model: { type: 'string' },
-              reasoningEffort: { type: 'string' }
+              reasoningEffort: { type: 'string' },
+              ignored: { type: 'array', items: { type: 'string' } }
             }
           },
           {
@@ -1139,19 +1204,26 @@ export async function apply(ctx) {
               preset: { type: 'string' },
               provider: { type: 'string' },
               model: { type: 'string' },
-              reasoningEffort: { type: 'string' }
+              reasoningEffort: { type: 'string' },
+              ignored: { type: 'array', items: { type: 'string' } }
             }
           }
         ]
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.kind === 'background'
-          ? `[dispatch] background job ${value.jobId} · profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}`
+      render: (_args, value) => {
+        // §8.4: continuable 丢弃 preset 换用与 reasoningEffort —— 渲染行把
+        // `ignored` 列表回显出来（`reasoningEffort=<值>(ignored)`，再加 ignored 项
+        // 明细），让模型「看见」被丢弃项；background/foreground 无忽略项时该后缀为空。
+        const ignored = value.ignored !== undefined && value.ignored.length > 0
+          ? `(ignored: ${value.ignored.join(', ')})`
+          : '';
+        const text = value.kind === 'background'
+          ? `[dispatch] background job ${value.jobId} · profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}${ignored}`
           : value.kind === 'continuable'
-            ? `[dispatch] started subagent ${value.subagentId} · profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}`
-            : `[dispatch] profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}\n\n${value.output}`
-      }]
+            ? `[dispatch] started subagent ${value.subagentId} · profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}${ignored}`
+            : `[dispatch] profile=${value.profile} · preset=${value.preset} · provider=${value.provider} · model=${value.model} · reasoningEffort=${value.reasoningEffort}${ignored}\n\n${value.output}`;
+        return [{ type: 'text', text }];
+      }
     },
     isConcurrencySafe: () => true,
     async execute(args, exec) {
@@ -1196,6 +1268,13 @@ export async function apply(ctx) {
         ...(merged.toolFilter !== undefined ? { toolFilter: merged.toolFilter } : {}),
         ...(merged.maxDepth !== undefined ? { maxDepth: merged.maxDepth } : {})
       };
+      // §8.2 结果回收默认剪枝：在 textFrom(result.output) 之前复用宿主
+      // toolResultPruner.pruneContent 预剪。`pruneResultOutput` 每次现取
+      // ctx.get('toolResultPruner') 以反映服务就绪状态；pruner 缺失时
+      // pruneBlocks 回退为不剪（剪枝是增强、非硬依赖）。envelope 参数虽已在
+      // 工具 schema 暴露（预留，V2.0-中期启用结构化信封回收），但 execute
+      // **不消费**它——本首切片只实现「剪枝默认」，不做信封注入。
+      const pruneResultOutput = (blocks) => pruneBlocks(blocks, ctx.get('toolResultPruner'));
       // Decision-level log: resolved effective delegation inputs, after the
       // cost guard and after request assembly, before dispatch.
       ctx.logger.info('[dsh-subagent-profile] dispatch:', JSON.stringify({
@@ -1266,7 +1345,19 @@ export async function apply(ctx) {
         // Continuable drops the profile's preset swap and reasoningEffort (the
         // child inherits the parent preset), so the observability meta must
         // report what actually took effect, not the requested-but-ignored values.
-        return { kind: 'continuable', subagentId: childId, profile: meta.profile, preset: 'inherit', provider: meta.provider, model: meta.model };
+        // §8.4 可见性修复：`reasoningEffort` 回显**请求值**（经 meta.reasoningEffort，
+        // 即 merged.reasoningEffort ?? '(default)'），`preset:'inherit'` 是真实生效值；
+        // `ignored` 明确列出被丢弃项，让模型「看见」被忽略的字段。
+        return {
+          kind: 'continuable',
+          subagentId: childId,
+          profile: meta.profile,
+          preset: 'inherit',
+          provider: meta.provider,
+          model: meta.model,
+          reasoningEffort: meta.reasoningEffort,
+          ignored: ['preset', 'reasoningEffort']
+        };
       }
       // A: background one-shot (job) path — jobs.start wraps start() with a
       // native AbortController (a Node global in a bundle; the dynamic-plugin
@@ -1285,7 +1376,7 @@ export async function apply(ctx) {
             const controller = new AbortController();
             return {
               cancel: (reason) => controller.abort(reason ?? 'dispatch: background subagent task killed'),
-              done: settleStart(ctx.subagents.start('profile', { ...request, signal: controller.signal }), controller.signal, meta)
+              done: settleStart(ctx.subagents.start('profile', { ...request, signal: controller.signal }), controller.signal, meta, pruneResultOutput)
             };
           }
         });
@@ -1304,9 +1395,14 @@ export async function apply(ctx) {
       // partial output text (withPartialText style).
       const failure = stopReasonError(result);
       if (failure !== undefined) throw new Error(withPartialText(failure, result.output));
-      return { output: textFrom(result.output), ...meta };
+      return { output: textFrom(pruneResultOutput(result.output)), ...meta };
     }
   });
+  // R1（共享规则）lock: the closed oneOf result schema must carry an identical
+  // shared meta key set across all three branches. Fires only at apply time; a
+  // future meta-field add that forgets one 分支 throws here (once), so the
+  // model-side schema never silently rejects a分支.
+  assertResultSchemaConsistency(dispatchTool.output.schema);
   // Register the tool only while enabled; unregister it the moment the switch
   // turns off so it disappears from the model's tool list without a restart.
   let disposeTool;

@@ -88,16 +88,27 @@ test('provide("subagent-profiles"): register/get/list/resolve are all functions'
 });
 
 test('systemPrompt.section: registers dispatch:profiles and orchestrator:mode', async () => {
-  const { ctx, records } = createFakeCtx();
+  // §8.1 gate: the primary judge is the PRESET feature (composedPreset ===
+  // 'orchestrator'), not the tool schema (dispatch is host-global, always visible,
+  // so schemas is only a defensive veto). The snapshot provides a composedPreset
+  // stub returning 'orchestrator' + the default dispatch-capable toolSchemas so an
+  // out-of-the-box apply() registers a non-empty orchestrator section.
+  const { ctx, records } = createFakeCtx({ services: { agentPresets: { composedPreset: () => 'orchestrator' } } });
   await mod.apply(ctx);
 
   const profiles = records.sectionCalls.find((s) => s.name === 'dispatch:profiles');
   assert.ok(profiles, 'systemPrompt.section must register dispatch:profiles');
   assert.equal(profiles.order, 116.5);
   assert.equal(typeof profiles.text, 'function');
-  const text = profiles.text();
-  assert.ok(text.length > 0, 'dispatch:profiles text() must be non-empty when enabled');
+  // §8.1: text() takes the assembly context (`{ agent, scope, signal }`). The
+  // snapshot provides an orchestrator composedPreset stub + a dispatch-capable
+  // fake agent (default toolSchemas = [{ name: 'dispatch' }]), so the gated text()
+  // is non-empty while enabled.
+  const text = profiles.text({ agent: {} });
+  assert.ok(text.length > 0, 'dispatch:profiles text() must be non-empty when enabled + dispatch-capable');
   assert.match(text, /Available dispatch profiles/);
+  // §8.3 一行行为规则进门控 profiles section（非常开 persona 注入）。
+  assert.match(text, /别把 1-2 步即可自查\/可搜完的小事委派出去/);
   // 引号引用（V2 §7.2）：description 在显示行被双引号包裹。
   assert.match(text, /swap-standard: "切换到 standard 预设的完整编码工具集。/);
   assert.match(text, /researcher: "关闭深度推理省 token，继承父工具。/);
@@ -105,8 +116,9 @@ test('systemPrompt.section: registers dispatch:profiles and orchestrator:mode', 
   const orchestrator = records.sectionCalls.find((s) => s.name === 'orchestrator:mode');
   assert.ok(orchestrator, 'systemPrompt.section must register orchestrator:mode');
   assert.equal(orchestrator.order, 117);
-  assert.equal(typeof orchestrator.text, 'string');
-  assert.ok(orchestrator.text.length > 0, 'orchestrator:mode text must be a non-empty string');
+  assert.equal(typeof orchestrator.text, 'function');
+  const orchestratorText = orchestrator.text({ agent: {} });
+  assert.ok(orchestratorText.length > 0, 'orchestrator:mode text must be non-empty when enabled + dispatch-capable');
 });
 
 test('agents.create is never touched at apply time', async () => {

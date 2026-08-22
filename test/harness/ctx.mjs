@@ -55,8 +55,20 @@ function makeDisposer() {
 // `webServer` and `systemPrompt` are provided by default so an out-of-the-box
 // apply() registers the settings route and the systemPrompt sections; override
 // them to exercise the optional branches (e.g. no systemPrompt => no sections).
+// `options.toolSchemas` overrides the array returned by `ctx.tools.schemas()`
+// (default `[{ name: 'dispatch' }]` — a dispatch-capable agent, so the §8.1
+// prompt gate passes in the default characterization snapshot). Pass `[]` to
+// simulate a non-dispatch-capable agent. `options.subagentsStart` overrides
+// `ctx.subagents.start` (a fake parent-agent driver for recycle/execute tests).
 function createFakeCtx(options = {}) {
   const services = { ...(options.services ?? {}) };
+  const toolSchemas = options.toolSchemas ?? [{ name: 'dispatch' }];
+  const subagentsStart = options.subagentsStart ?? (() => {
+    throw new Error('ctx.subagents.start is not available in the characterization fake');
+  });
+  const startContinuable = options.startContinuable ?? (() => {
+    throw new Error('ctx.subagents.startContinuable is not available in the characterization fake');
+  });
   const records = {
     logs: { info: [], warn: [], error: [] },
     effects: [],
@@ -139,12 +151,12 @@ function createFakeCtx(options = {}) {
     logger,
     subagents: {
       registerProvider(provider) { records.registerProviderCalls.push(provider); return makeDisposer(); },
-      start() { throw new Error('ctx.subagents.start is not available in the characterization fake'); },
-      startContinuable() { throw new Error('ctx.subagents.startContinuable is not available in the characterization fake'); }
+      start: subagentsStart,
+      startContinuable,
     },
     tools: {
       register(tool) { records.registerToolCalls.push(tool); return makeDisposer(); },
-      schemas(...args) { records.schemaCalls.push(args); return []; },
+      schemas(...args) { records.schemaCalls.push(args); return toolSchemas; },
       restrict() { throw new Error('ctx.tools.restrict is not available in the characterization fake'); }
     },
     agents: {
