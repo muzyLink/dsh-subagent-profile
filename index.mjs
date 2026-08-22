@@ -21,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-subagent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { textFrom, stopReasonError, withPartialText, sanitizeProfile, MAX_TOKENS, MAX_DEPTH, GUIDANCE_PREFIX } from './lib/pure.mjs';
+import { textFrom, stopReasonError, withPartialText, sanitizeProfile, GUIDANCE_PREFIX, assertHardLimits, computeContinuableAllow } from './lib/pure.mjs';
 import { readResult } from './lib/shims.mjs';
 
 export const name = 'dsh-subagent-profile';
@@ -196,14 +196,52 @@ function persistEnabled(enabled) {
 
 // --- module-level helpers (kept inline; the packages do not export them) ---
 
-// F5: runtime-derived cost guard. (MAX_TOKENS / MAX_DEPTH are imported from
-// lib/pure.mjs — the single source of truth shared with sanitizeProfile.) Reads the optional `llm` service (undefined =>
-// guard skipped) and validates provider / model / reasoningEffort against the
-// live provider directory, plus the maxTokens/maxDepth caps. Used by both the
-// provider's authoritative check and the dispatch tool's pre-check.
-async function assertCostGuard(parent, profile) {
+// F5: runtime-derived cost guard. Two parts (SPEC §7.3):
+//   ① always-on hard caps (assertHardLimits, in lib/pure.mjs) — maxTokens /
+//      maxDepth are hard delegation caps, independent of the `llm` service, so
+//      they must NOT stop applying when `llm` is absent (the old `if (llm ===
+//      undefined) return` skipped them).
+//   ② llm capability — validates provider / model / reasoningEffort against the
+//      live provider directory. When the `llm` service is absent OR its provider
+//      directory is empty (an adapter without discovery), capability cannot be
+//      verified: per `allowFailOpen` (SPEC §12.1 migration switch) either
+//      fail-open compat (warn + skip; v1 数据迁移中) or fail-loud reject. A
+//      profile that requests none of provider/model/reasoningEffort has nothing
+//      to verify and always passes (valid in a headless deployment).
+// Used by both the provider's authoritative check and the dispatch tool's
+// pre-check. `allowFailOpen`/`logger` are injected because this function is
+// module-scoped and cannot reach the apply closure's `allowFailOpen`/`ctx.logger`.
+async function assertCostGuard(parent, profile, allowFailOpen, logger) {
+  // ① 硬上限 always-on（不依赖 llm）。
+  assertHardLimits(profile.maxTokens, profile.maxDepth);
+
+  // ② 仅当 profile 请求了需核验能力面的字段时才进入 llm 校验（无头/headless 部署下
+  //    persona-only / toolFilter-only 的 profile 合法，不应被 fail-loud 拒绝）。
+  const needsLlm = ['provider', 'model', 'reasoningEffort'].some(
+    (key) => typeof profile[key] === 'string' && profile[key].length > 0
+  );
+  if (!needsLlm) return;
+
   const llm = parent.ctx.get('llm');
-  if (llm === undefined) return;
+  // ③ 目录为空检测：llm 存在但其 provider 目录为空（无发现能力）→ 无法核验。
+  let emptyDirectory = false;
+  if (llm !== undefined) {
+    try {
+      const providers = await llm.listProviders();
+      emptyDirectory = (providers ?? []).length === 0;
+    } catch {
+      emptyDirectory = true;
+    }
+  }
+  if (llm === undefined || emptyDirectory) {
+    if (allowFailOpen === true) {
+      logger.warn('llm 不可用：fail-open 兼容模式（v1 数据迁移中，建议保存一次配置以升级到 fail-loud）');
+      return;
+    }
+    throw new Error('dispatch: 模型能力不可验证：fail-loud 拒绝（可在配置中显式开启兼容模式）');
+  }
+
+  // ④ provider 注册校验（目录非空时才能判定「不在目录」）。
   if (typeof profile.provider === 'string' && profile.provider.length > 0) {
     const providers = await llm.listProviders();
     if (!(providers ?? []).some((provider) => provider && provider.id === profile.provider)) {
@@ -212,13 +250,14 @@ async function assertCostGuard(parent, profile) {
   }
   const effectiveProvider = profile.provider !== undefined ? profile.provider : parent.options.provider;
   const effectiveModel = profile.model !== undefined ? profile.model : parent.options.model;
+  // ⑤ model 校验。resolveModelInfo does not reject unknown models (catalog
+  //    membership is advisory), so validate against the advertised catalog
+  //    instead. An EMPTY catalog (adapter without discovery) cannot be verified
+  //    and is skipped — 目录级空集已在 ③ 走 allowFailOpen 分支，此处仅兜底
+  //    per-provider 空目录。A non-empty catalog that does not advertise the model
+  //    fails loud. An unverifiable lookup (listModels(undefined) when no provider
+  //    is known) becomes a clean fail-loud error instead of leaking "undefined".
   if (typeof profile.model === 'string' && profile.model.length > 0) {
-    // resolveModelInfo does not reject unknown models (catalog membership is
-    // advisory), so validate against the advertised catalog instead. An EMPTY
-    // catalog (adapter without discovery) cannot be verified and is skipped; a
-    // non-empty catalog that does not advertise the model fails loud. An
-    // unverifiable lookup (listModels(undefined) when no provider is known)
-    // becomes a clean fail-loud error instead of leaking "undefined".
     let models;
     try {
       models = await llm.listModels(effectiveProvider);
@@ -227,24 +266,17 @@ async function assertCostGuard(parent, profile) {
     }
     const listed = models ?? [];
     const known = listed.length > 0 && listed.some((model) => model && (model.id === profile.model || model.name === profile.model));
-    // Throw only when the catalog is non-empty AND the model is not in it; an
-    // empty catalog (adapter without discovery) is skipped, not rejected.
     if (listed.length > 0 && !known) {
       throw new Error(`dispatch: model "${profile.model}" is not advertised by provider "${String(effectiveProvider)}"`);
     }
   }
+  // ⑥ reasoningEffort 校验。
   if (typeof profile.reasoningEffort === 'string' && profile.reasoningEffort.length > 0) {
     try {
       await llm.resolveCallConfig({ provider: effectiveProvider, model: effectiveModel, reasoningEffort: profile.reasoningEffort });
     } catch (error) {
       throw new Error(`dispatch: reasoningEffort "${profile.reasoningEffort}" is not supported by provider "${String(effectiveProvider)}" model "${String(effectiveModel)}": ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
-  if (typeof profile.maxTokens === 'number' && profile.maxTokens > MAX_TOKENS) {
-    throw new Error(`dispatch: maxTokens ${profile.maxTokens} exceeds the delegation cap ${MAX_TOKENS}`);
-  }
-  if (typeof profile.maxDepth === 'number' && profile.maxDepth > MAX_DEPTH) {
-    throw new Error(`dispatch: maxDepth ${profile.maxDepth} exceeds the delegation cap ${MAX_DEPTH}`);
   }
 }
 
@@ -408,11 +440,11 @@ export async function apply(ctx) {
   // a hard dependency: any failure only warns and the builtin seeds work.
   const profilesFile = join(dshHome(), 'subagent-profiles.json');
   // V2 migration switch (SPEC §7.3 / §12.1): whether the cost guard may fail-open
-  // when the `llm` service is absent. Defaults to true (legacy-compatible) so an
-  // old deployment keeps its fail-open behavior until it explicitly opts out;
-  // a v2 envelope carries its own stored value. Task 4 (cost-guard narrow) reads
-  // this flag.
-  let allowFailOpen = true;
+  // when the `llm` service is absent. Defaults to FALSE (fail-loud, SPEC §7.3
+  // 评审遗留裁定: 全新部署 fail-loud); only a v1 data file being read sets it to
+  // true (v1 迁移 fail-open 兼容). A v2 envelope carries its own stored value.
+  // Task 4 (cost-guard narrow) reads this flag.
+  let allowFailOpen = false;
   function loadProfiles() {
     if (!existsSync(profilesFile)) return;
     try {
@@ -428,7 +460,8 @@ export async function apply(ctx) {
         entries = parsed.profiles;
         version = parsed.version ?? 2;
         // v2 缺 allowFailOpen 字段时按 fail-open 兼容（显式 false 才关闭）；
-        // 全新部署默认语义由 Task 4 定夺。
+        // 全新部署默认已定：fail-loud（初始 allowFailOpen=false，见上方声明），
+        // 读入 v2 文件按其存储值读取并保持。
         allowFailOpen = parsed.allowFailOpen !== false;
       } else {
         ctx.logger.warn('[dsh-subagent-profile] persisted profile file has an unrecognized shape; ignoring');
@@ -863,8 +896,9 @@ export async function apply(ctx) {
       if (typeof profile.preset === 'string' && profile.preset !== 'inherit' && !whitelist.has(profile.preset)) {
         throw new Error(`dispatch: preset "${profile.preset}" is not in the target-preset whitelist`);
       }
-      // F5: authoritative cost guard (runtime-derived; skipped when llm is absent).
-      await assertCostGuard(parent, profile);
+      // F5: authoritative cost guard (runtime-derived; hard caps always applied,
+      // llm capability gated by allowFailOpen — SPEC §7.3).
+      await assertCostGuard(parent, profile, allowFailOpen, ctx.logger);
       // Delegation depth: shipped helpers — assert the cap value, then resolve
       // the child depth (parent floor + 1) and enforce the cap.
       assertSubagentMaxDepth(profile.maxDepth);
@@ -1141,8 +1175,9 @@ export async function apply(ctx) {
         const parentComposed = parentPresets !== undefined ? parentPresets.composedPreset(parent.ctx) : undefined;
         if (merged.preset === parentComposed) merged.preset = 'inherit';
       }
-      // F5: cost guard (runtime-derived; skipped when llm is absent).
-      await assertCostGuard(parent, merged);
+      // F5: cost guard (runtime-derived; hard caps always applied, llm capability
+      // gated by allowFailOpen — SPEC §7.3).
+      await assertCostGuard(parent, merged, allowFailOpen, ctx.logger);
       // D: effective delegation values for observability.
       const meta = {
         profile: args.profile ?? '(inline)',
@@ -1178,6 +1213,13 @@ export async function apply(ctx) {
       // later turns. Treated first so a caller asking for both background and
       // continuable gets the continuable child.
       if (args.continuable === true) {
+        // 安全 P0-b（SPEC §7.1 第 2 条）：provider `start` 的 !enabled 检查只拦
+        // `start`，不拦 `startContinuable` —— 这里显式补上。当前 syncTool 会在
+        // 禁用时注销 dispatch 工具（间接门），此处是防御性兜底：禁用后
+        // dispatch(continuable:true) 必须 fail-loud，不得静默派生子树。
+        if (!enabled) {
+          throw new Error('dispatch: 插件已禁用（设置 → 子 Agent 方案 重新启用）');
+        }
         if (args.run_in_background === true) {
           ctx.logger.warn('[dsh-subagent-profile] dispatch: both continuable and run_in_background are true; continuable takes precedence');
         }
@@ -1188,22 +1230,37 @@ export async function apply(ctx) {
         if (merged.reasoningEffort !== undefined) {
           ctx.logger.warn(`[dsh-subagent-profile] continuable mode cannot set reasoningEffort; ignoring "${merged.reasoningEffort}"`);
         }
+        // 安全 P0-b（SPEC §7.1 第 1 条）：预加工 toolFilter 为闭集 allow。continuable
+        // 走宿主 applyChildComposition→tools.restrict，prepareContinuable 返回 {}，
+        // 插件侧无法重算父∩子交集，故在此把 allow 预加工为闭集传到 request。
+        //
+        // 假设：continuable 继承父预设（preset swap 被忽略，见上方 warn）⇒
+        // 子工具集 ≈ 父工具集，故 父集 − run_code − deny 可安全作为 restrict 的
+        // allow。失效：任何导致子工具集与父工具集不一致的宿主行为变化（非仅
+        // preset swap——例如未来允许 swap preset、组合不同工具集等），父集都可能
+        // 含子集上不存在之工具 → tools.restrict 会抛「未知工具」→ 本缓解自动降级
+        // 为 fail-loud（保守安全）——此时必须替换为真交集（父∩子）。
+        const parentNames = new Set(parent.ctx.tools.schemas(parent).map((schema) => schema.name));
+        const effectiveAllow = computeContinuableAllow(parentNames, merged.toolFilter);
         const hasAgentOptions = merged.provider !== undefined || merged.model !== undefined || merged.maxTokens !== undefined;
+        const continuableRequest = {
+          prompt: [{ type: 'text', text: args.prompt }],
+          parent,
+          ...(hasAgentOptions ? { agentOptions: {
+            ...(merged.provider !== undefined ? { provider: merged.provider } : {}),
+            ...(merged.model !== undefined ? { model: merged.model } : {}),
+            ...(merged.maxTokens !== undefined ? { maxTokens: merged.maxTokens } : {})
+          } } : {}),
+          ...(merged.persona !== undefined ? { persona: merged.persona } : {}),
+          // 恒传闭集 allow（覆盖原 merged.toolFilter 透传）；空集在
+          // computeContinuableAllow 内 fail-loud。
+          toolFilter: { allow: effectiveAllow },
+          ...(merged.maxDepth !== undefined ? { maxDepth: merged.maxDepth } : {})
+        };
         const { childId } = await ctx.subagents.startContinuable({
           provider: 'profile',
           label: String(args.prompt ?? '').slice(0, 60),
-          request: {
-            prompt: [{ type: 'text', text: args.prompt }],
-            parent,
-            ...(hasAgentOptions ? { agentOptions: {
-              ...(merged.provider !== undefined ? { provider: merged.provider } : {}),
-              ...(merged.model !== undefined ? { model: merged.model } : {}),
-              ...(merged.maxTokens !== undefined ? { maxTokens: merged.maxTokens } : {})
-            } } : {}),
-            ...(merged.persona !== undefined ? { persona: merged.persona } : {}),
-            ...(merged.toolFilter !== undefined ? { toolFilter: merged.toolFilter } : {}),
-            ...(merged.maxDepth !== undefined ? { maxDepth: merged.maxDepth } : {})
-          },
+          request: continuableRequest,
           signal: exec.signal
         });
         // Continuable drops the profile's preset swap and reasoningEffort (the

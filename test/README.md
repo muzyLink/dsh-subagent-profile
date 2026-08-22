@@ -18,6 +18,14 @@ harness simulation.
 - `pure.test.mjs` — true unit tests for the import-free helpers in
   `lib/pure.mjs` (`textFrom` / `toStopReason` / `stopReasonError` /
   `withPartialText`).
+- `continuable-guard.test.mjs` — V2 安全 P0-b（§7.1）：`computeContinuableAllow`
+  闭集计算（run_code 恒剔 / deny 生效 / allow 交集 / 空集 fail-loud / 去重等
+  11 用例），加一条经 dispatch.execute 的**禁用路径**（enabled=false 时 continuable
+  分支 fail-loud）。
+- `cost-guard.test.mjs` — V2 安全 P0-b（§7.3）：`assertHardLimits` 硬上限 always-on
+  （不随 llm 缺失失效），加 llm 缺失 / 空 provider 目录下按 `allowFailOpen` 的
+  fail-loud / fail-open 分支（经 dispatch.execute 触发），并断言空目录在 model
+  校验前短路（listModels 不可达）。
 
 ## Snapshot, not full simulation
 

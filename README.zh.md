@@ -90,6 +90,7 @@ dispatch(
 
 - **后台**一次性派发需要加载 `@deepseek-ai/dsh-jobs` 与 `@deepseek-ai/dsh-tool-jobs`，否则报「background jobs unavailable」。
 - **可续跑**模式走 DSH 标准组合路径，因此 `preset` 换用与 `reasoningEffort` 会被忽略（继承父预设、使用默认推理强度）。
+- **可续跑**工具门为插件侧缓解：子 Agent 的 `allow` 预加工为闭集 —— 父工具集 − `run_code` − `deny`，再与 `allow` 取交集。**假设：** 可续跑继承父预设 ⇒ 子工具集 ≈ 父工具集。**失效条件：** 任何导致子工具集与父工具集不一致的宿主行为变化（非仅换用预设——例如未来允许换用预设、组合不同工具集等），父集都可能含子集没有的工具，`tools.restrict` 会抛「未知工具」→ 本缓解自动降级为 fail-loud（保守安全）；待上游提供 provider 守卫接缝后替换为真交集。
 
 ## 贡献
 
