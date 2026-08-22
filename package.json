@@ -9,7 +9,8 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
   },
   "exports": {
     ".": "./index.mjs",
