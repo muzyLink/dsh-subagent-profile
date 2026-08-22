@@ -12,17 +12,17 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync,
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { foldConsumedWork } from '@deepseek-ai/dsh-agent';
 import {
   appendDelegatedPolicyOverrides,
   assertSubagentMaxDepth,
   captureDelegatedPolicyOverrides,
-  finalAssistantOutput,
   resolveChildAgentOptions,
   resolveChildDepth,
 } from '@deepseek-ai/dsh-subagent';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { textFrom, stopReasonError, withPartialText } from './lib/pure.mjs';
+import { readResult } from './lib/shims.mjs';
 
 export const name = 'dsh-subagent-profile';
 export const inject = ['subagents', 'tools', 'agents'];
@@ -195,56 +195,6 @@ function persistEnabled(enabled) {
 }
 
 // --- module-level helpers (kept inline; the packages do not export them) ---
-
-function textFrom(blocks) {
-  return (Array.isArray(blocks) ? blocks : [])
-    .filter((block) => block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text)
-    .join('');
-}
-
-// Shipped toStopReason: map a turn-end reason to the seam's terminal vocabulary.
-function toStopReason(reason) {
-  switch (reason?.kind) {
-    case 'completed': return 'completed';
-    case 'max-tokens': return 'max-tokens';
-    case 'aborted': return 'aborted';
-    case 'blocked': return 'refusal';
-    default: return 'error';
-  }
-}
-
-// readResult: shipped shape. The terminal turn reason comes from the imported
-// foldConsumedWork; the selected output comes from the imported
-// finalAssistantOutput (last non-empty assistant message, else joined
-// text-delta chunks, else undefined -> []).
-function readResult(child, boundary, cancelled) {
-  const own = child.session.events.slice(boundary);
-  const end = foldConsumedWork(own).end;
-  const recorded = toStopReason(end?.data.reason);
-  const stopReason = cancelled && recorded !== 'completed' ? 'aborted' : recorded;
-  return { output: finalAssistantOutput(own) ?? [], stopReason };
-}
-
-// Shipped stopReasonError + withPartialText wording (dsh-tool-subagent L55-75).
-function stopReasonError(result) {
-  switch (result.stopReason) {
-    case 'completed': return;
-    case 'aborted': return 'dispatch: subagent run was cancelled';
-    case 'error': return 'dispatch: subagent run failed';
-    case 'max-tokens': return 'dispatch: subagent run hit its token limit before finishing';
-    case 'refusal': return 'dispatch: subagent declined the task';
-    default: return `dispatch: subagent run ended abnormally (${String(result.stopReason)})`;
-  }
-}
-
-function withPartialText(error, output) {
-  const text = (Array.isArray(output) ? output : [])
-    .filter((block) => block && block.type === 'text')
-    .map((block) => block.text)
-    .join('');
-  return text.length === 0 ? error : `${error}\nPartial output before the run ended:\n${text}`;
-}
 
 // F5: conservative delegation caps for maxTokens / maxDepth.
 const MAX_TOKENS = 65536;

@@ -18,7 +18,7 @@
   },
   "files": [
     "index.mjs",
-    "lib/client.js",
+    "lib",
     "cordis.patch.yml",
     "presets",
     "docs",
