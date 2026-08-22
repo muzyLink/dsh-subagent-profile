@@ -34,6 +34,14 @@ harness simulation.
   R1 三分支共享元数据键集一致（漏 `ignored` 即 throw）；`envelope` 参数 schema 暴露
   且 execute 不消费；前台路径注入 toolResultPruner 后 pruneContent 在 textFrom 前
   被调用。
+- `facade.test.mjs` — V2 Task 6a（§9.2）：`lib/shims.mjs` facade 面——断言每个导出
+  helper（守卫型 + 功能映射型 + `readResult`）都是可调用函数（junction 解析到真实
+  实现），并直接驱动 `__fallbacks`（本地降级实现）锁定 fail-soft 语义：`createUserMessage`
+  构造 user 消息、`resolveChildAgentOptions` 合并父路由+per-child+深度、
+  `captureDelegatedPolicyOverrides` 审批恒 `'never'`、`appendDelegatedPolicyOverrides`
+  追加 sandbox/approval 事件、`finalAssistantOutput` 选取规则、`foldConsumedWork`
+  读取 `.end`、`defineTool` 抛清晰缺失信息。即使无法真实删除 node_modules 包，
+  该测试也覆盖了降级路径（见计划验证 3）。
 
 ## §8.1 prompt-gate criterion (the one the code actually uses)
 
@@ -126,6 +134,39 @@ service `apply()` consumes — e.g. `webServer.register` arg shape,
 signature**. The comments in `ctx.mjs` mark exactly which fake methods are the
 contract seams. Re-run `npm test` after such an upgrade; a shape mismatch shows
 up as the fake failing to drive `apply()`, not as a silent pass.
+
+### `lib/shims.mjs` helper lifecycle (when a host rc renames / adds / removes an `@deepseek-ai` symbol)
+
+`lib/shims.mjs` is the **only** `@deepseek-ai` import point; `index.mjs` gets
+every helper from it. When a host upgrade changes a helper, route it through the
+facade by **class**:
+
+- **Guard-type** (`assertSubagentMaxDepth` / `resolveChildDepth`) — delegation-depth
+  safety gates. Import them **statically** and re-export, and **do not** add a
+  fallback: a renamed/removed export must fail module load with the ESM link error
+  (fail-loud, never a weakened reimplementation). Identifying them: if losing the
+  helper could let a child exceed `MAX_DEPTH`, it is guard-type.
+- **Function-mapping** (`foldConsumedWork` / `finalAssistantOutput` /
+  `createUserMessage` / `appendDelegatedPolicyOverrides` /
+  `captureDelegatedPolicyOverrides` / `resolveChildAgentOptions` / `defineTool`) —
+  observable behavior is allowed to degrade with a warning. Identifying them: a
+  no-op or local equivalent does **not** weaken a security boundary.
+
+**Adding a new function-mapping helper**:
+1. Add a `loadSoft('@deepseek-ai/<pkg>', '<name>', <localFallback>, '<warn text>')`
+   entry to the `Promise.all([...])` in `lib/shims.mjs` (the 7 loads run in parallel).
+2. Write the `<localFallback>` (functionally equivalent, or explicitly documented
+   as approximate + safe-degraded — see the `foldConsumedWork` / `createUserMessage`
+   comments).
+3. Add it to `export const __fallbacks`, and add it to the named `export { ... }`.
+4. Add a corresponding facade case in `test/facade.test.mjs` (export-is-a-function +
+   the fallback semantics). If the routing branch matters, drive `loadSoft` with a
+   stub `importer` (5th arg) to seal the catch / not-a-function branches.
+
+**Removing a helper**: reverse the above — drop the `loadSoft` entry, the
+fallback, the `__fallbacks` entry, the `export { ... }` name (and re-export if it
+was guard-type), and remove its facade test. Re-run `npm test` and re-verify that
+no consumer in `index.mjs` still references the removed name.
 
 ## DSH_HOME isolation
 

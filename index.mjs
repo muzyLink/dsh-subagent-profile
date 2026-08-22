@@ -16,13 +16,13 @@ import {
   appendDelegatedPolicyOverrides,
   assertSubagentMaxDepth,
   captureDelegatedPolicyOverrides,
+  createUserMessage,
+  defineTool,
+  readResult,
   resolveChildAgentOptions,
   resolveChildDepth,
-} from '@deepseek-ai/dsh-subagent';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { defineTool } from '@deepseek-ai/dsh-tools';
+} from './lib/shims.mjs';
 import { textFrom, stopReasonError, withPartialText, sanitizeProfile, GUIDANCE_PREFIX, assertHardLimits, computeContinuableAllow, pruneBlocks, assertResultSchemaConsistency } from './lib/pure.mjs';
-import { readResult } from './lib/shims.mjs';
 
 export const name = 'dsh-subagent-profile';
 export const inject = ['subagents', 'tools', 'agents'];
