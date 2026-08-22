@@ -2,7 +2,7 @@
 
 <!-- Hero -->
 <div align="center">
-  <b style="font-size: 1.15em;">子 Agent 派发方案化插件 —— 用对的人（预设 / 模型 / 推理强度）干对的事</b><br /><br />
+  <b style="font-size: 1.15em;">Subagent dispatch, profiled — the right agent for the right task (preset / model / reasoning effort)</b><br /><br />
   <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
   <img alt="npm" src="https://img.shields.io/npm/v/dsh-subagent-profile.svg" />
   <img alt="DSH" src="https://img.shields.io/badge/DSH-0.1.0--rc.6%20~%20rc.8-blue.svg" />
@@ -91,6 +91,30 @@ Delegation never lets a subagent gain more power than you already have — this 
 - **Background** one-shot dispatch requires `@deepseek-ai/dsh-jobs` and `@deepseek-ai/dsh-tool-jobs` to be loaded; otherwise it fails with "background jobs unavailable".
 - **Continuable** mode goes through the DSH standard composition path, so the `preset` swap and `reasoningEffort` are ignored (the child inherits the parent preset at the default reasoning effort).
 - **Continuable** tool gate is a plugin-side mitigation: the child's `allow` is pre-computed as a closed set — parent tool set − `run_code` − `deny`, then intersected with `allow`. **Assumption:** continuable inherits the parent preset, so the child's tool set ≈ the parent's. **Failure condition:** any host behavior change that makes the child's tool set differ from the parent's (not only preset swap — e.g. a future preset swap, composing a different tool set) means the parent set can contain tools the child does not have, so `tools.restrict` throws "unknown tool" and this mitigation automatically degrades to fail-loud (conservatively safe); it must then be replaced with a true parent ∩ child intersection once the upstream provides a provider guard seam.
+
+## Repository structure
+
+```
+dsh-subagent-profile/
+├── index.mjs                     # host side: the plugin itself (dispatch tool, profile provider, service, HTTP routes)
+├── lib/
+│   ├── client.js                 # browser side: settings page + dispatch tool-call card
+│   ├── pure.mjs                  # dependency-free pure functions (sanitize / prune / guard math — unit-tested)
+│   └── shims.mjs                 # the single @deepseek-ai import facade (guards fail loud, helpers degrade softly)
+├── presets/orchestrator/         # bundled "orchestrator" agent preset (self-installed, synced on every startup)
+├── cordis.patch.yml              # bundle patch: inserts the plugin row into the host composition
+├── package.json                  # metadata, files whitelist, exports
+├── scripts/release.mjs           # release helper (version bump / tag checks)
+├── docs/
+│   └── screenshots/              # README screenshots
+├── test/                         # host-side tests (node:test, zero extra deps; 96 cases)
+│   ├── README.md / README.zh.md  # test directory guide (EN/ZH)
+│   ├── harness/ctx.mjs           # fake Cordis ctx + ~/.dsh isolation
+│   ├── characterization.test.mjs # apply() behavior snapshot
+│   └── *.test.mjs                # pure / input-schema / persist / continuable-guard / cost-guard / gating / recycle / facade
+├── README.md / README.zh.md      # this document (EN/ZH)
+└── LICENSE
+```
 
 ## Contributing
 

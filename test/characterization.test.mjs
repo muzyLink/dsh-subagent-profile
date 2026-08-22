@@ -3,7 +3,7 @@
 // This is a CHARACTERIZATION test: it locks the current observable apply-time
 // wiring so later slices can regress-check against it. It is a snapshot, not a
 // full simulation — provider.start / dispatch execute are explicitly not
-// exercised (SPEC §6.2/§6.3b "不单测"), and `agents.create` is asserted to be
+// exercised (SPEC §6.2/§6.4 "不单测"), and `agents.create` is asserted to be
 // never touched. See test/README.md.
 
 import { test } from 'node:test';

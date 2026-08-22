@@ -3,7 +3,7 @@
 // 「当前席 Agent 的 composedPreset === 'orchestrator'（预设特征主判据）且插件启用」
 // 时非空；否则返回 ''。
 //
-// 判据（以源码为准确认，见 test/README.md）：
+// 判据（以源码为准确认，见 docs/V2-SPEC.md §6.4 / §8.1）：
 //   section.text(context) 收到 `{ agent, scope, signal }`（host 经由
 //   assembleContextFor(agent, signal) 调用）。dispatch 工具由本 host 行注册，经
 //   dsh-tools schemas(scope) 的 global 继承起点对每个 agent 恒可见，故
@@ -12,11 +12,8 @@
 //   schemas 判据降为**否决**——schemas(agent) 明确不含 dispatch → 必空（防御性，
 //   生产恒含 dispatch，正常路径不触发）。
 //
-// 快照更新说明（规格评审预告过的 T5 快照变化）：characterization.test.mjs 的
-// systemPrompt.section 快照改为「composedPreset 桩返回 orchestrator + dispatch-
-// capable toolSchemas 下 text({ agent }) 非空」——主判据由 schemas 改为 preset
-// 特征后，默认 fake（无 agentPresets 桩）会命中「无 agentPresets → 空」分支，
-// 故快照需提供 composedPreset 桩。详见报告。
+// 快照口径：characterization 的 systemPrompt 快照在 §8.1 主判据下需 composedPreset 桩
+// + dispatch-capable toolSchemas 才能非空。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

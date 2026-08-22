@@ -1,4 +1,4 @@
-// index.mjs — dsh-subagent-profile host half (formal plugin bundle).
+// index.mjs — dsh-subagent-profile host side (formal plugin bundle).
 // Converted from prototype/subagent-profile/host.plugin.js (the dynamic-plugin
 // `code.host` body) with import slimming: the inline foldConsumedWork /
 // accountsForClaim / lastAssistantContent / uuid / AbortController-shim are
