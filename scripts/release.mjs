@@ -105,7 +105,10 @@ if (head !== remoteHead) {
 
 console.log(`\n当前版本 ${cur} -> 目标版本 ${target}${published ? `(npm latest 为 ${published})` : '(npm 上暂无此包)'}`)
 
-// 3. 手动确认(非 TTY 环境自动跳过)
+// 3. 上一个版本 tag(在打新 tag 之前解析,以 HEAD 可达的最近 tag 为准)
+const prevTag = trySh('git', ['describe', '--tags', '--abbrev=0', 'HEAD'])
+
+// 4. 手动确认(非 TTY 环境自动跳过)
 if (!dryRun && process.stdin.isTTY) {
   process.stdout.write('\n将提交、打 tag、推送并发布到 npm。按 Enter 继续,Ctrl+C 取消…')
   await new Promise((resolve) => process.stdin.once('data', resolve))
@@ -128,7 +131,7 @@ step('git', ['push', REMOTE, 'main'])
 step('git', ['push', REMOTE, `v${target}`])
 
 // ---------- npm 发布 ----------
-console.log('\n$ pnpm publish --no-git-checks')
+console.log(dryRun ? '\n[dry-run] $ pnpm publish --no-git-checks' : '\n$ pnpm publish --no-git-checks')
 if (!dryRun) {
   try {
     execFileSync('pnpm', ['publish', '--no-git-checks'], { encoding: 'utf8', cwd: ROOT, stdio: ['ignore', 'pipe', 'inherit'] })
@@ -158,7 +161,6 @@ try {
 }
 
 // ---------- Release Notes 草稿 ----------
-const prevTag = trySh('git', ['describe', '--tags', '--abbrev=0', `v${target}^`])
 console.log(`\n================ Release Notes 草稿(v${target}) ================`)
 console.log(`# v${target}`)
 console.log('')
@@ -169,9 +171,12 @@ console.log('')
 console.log('- (把下面的提交整理成要点,或引用 PR 链接)')
 console.log('')
 if (prevTag) {
-  const log = sh('git', ['log', `${prevTag}..HEAD`, '--oneline']) || '(无)'
+  const log = (sh('git', ['log', `${prevTag}..HEAD`, '--oneline']) || '')
+    .split('\n')
+    .filter((l) => l && !l.includes(`release v${target}`))
+    .join('\n')
   console.log(`自 ${prevTag} 以来的提交:`)
-  console.log(log)
+  console.log(log || '(无)')
 } else {
   console.log('(首个正式版本,无历史提交可列)')
 }
