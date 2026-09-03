@@ -2,7 +2,7 @@
 // 覆盖：
 //   * ① per-call 覆盖优先于 profile：profile 设 model='m1'、per-call 设 model='m2'
 //     → 前台 execute 结果与决策轨迹的 effective.model 均为 'm2'。
-//   * ② 未知字段拒绝：DISPATCH_PARAMETERS 键集恰为白名单 15 键（9 配置 + 2 模式 +
+//   * ② 未知字段拒绝：DISPATCH_PARAMETERS 键集恰为白名单 16 键（10 配置 + 2 模式 +
 //     profile/tokenTier/envelope/prompt + 双名键 reasoning_effort），toolFilter
 //     schema 闭合（additionalProperties:false，无未知键接受路径）。
 //   * ③ continuable 下 per-call reasoningEffort 忽略但回显请求值：结果
@@ -10,23 +10,26 @@
 //   * ④ 字段双名（官方名 reasoning_effort ↔ 旧名 reasoningEffort）：同值等效、
 //     同送两义 fail-loud、旧名弃用标注、requested 对外显示官方名。
 //   * ⑤ 文案分工与错误闭环（dispatch 描述 / model 参数描述 grep 断言）。
+//   * ⑥ strategy：7 键闭合对象与 auto 字符串、展开等价、顶层优先、auto 解析链
+//     三态、策略内双名归一、与既有闸联动、来源标记 strategy/auto。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DISPATCH_PARAMETERS, DISPATCH_PARAMETER_KEYS, normalizeReasoningEffort } from '../lib/core/dispatch-schema.mjs';
-import { requestedOf } from '../lib/core/decision-trace.mjs';
+import { DISPATCH_PARAMETERS, DISPATCH_PARAMETER_KEYS, normalizeReasoningEffort, expandStrategy } from '../lib/core/dispatch-schema.mjs';
+import { requestedOf, effectiveModelSourceOf } from '../lib/core/decision-trace.mjs';
 import { createFakeCtx, makeIsolatedDshHome } from './harness/ctx.mjs';
 
 const mod = await import('../index.mjs');
 
-// 白名单键集 = 9 配置（preset/model/provider/reasoningEffort/persona/toolFilter/
-// maxTokens/maxDepth + tokenTier 预算档）+ 2 模式（run_in_background/continuable）
-// + profile（容器选择）/ envelope（模式）/ prompt（任务文本）+ 双名键
-// reasoning_effort（官方名，与 reasoningEffort 等效；归一化见 normalizeReasoningEffort）。
-// 键集断言以未列出的任一键都必须被拒绝的闭合口径为准。
+// 白名单键集 = 10 配置（preset/model/provider/reasoningEffort/persona/toolFilter/
+// maxTokens/maxDepth + tokenTier 预算档 + strategy 策略对象）+ 2 模式
+// （run_in_background/continuable）+ profile（容器选择）/ envelope（模式）/
+// prompt（任务文本）+ 双名键 reasoning_effort（官方名，与 reasoningEffort 等效；
+// 归一化见 normalizeReasoningEffort）。键集断言以未列出的任一键都必须被拒绝的
+// 闭合口径为准。
 const WHITELIST_KEYS = [
   'profile', 'preset', 'model', 'provider', 'reasoningEffort', 'reasoning_effort', 'tokenTier',
-  'persona', 'toolFilter', 'maxTokens', 'maxDepth',
+  'persona', 'toolFilter', 'maxTokens', 'maxDepth', 'strategy',
   'run_in_background', 'continuable', 'envelope', 'prompt',
 ];
 
@@ -77,11 +80,11 @@ test('per-call 优先：profile model=m1，per-call model=m2 → effective.model
 
 // ---- ② 未知字段拒绝：白名单键集闭合 + toolFilter 闭合 ---------------------------
 
-test('参数 schema：键集恰为白名单 15 键（含双名键 reasoning_effort，无未知字段接受路径）', () => {
+test('参数 schema：键集恰为白名单 16 键（含双名键 reasoning_effort，无未知字段接受路径）', () => {
   const keys = Object.keys(DISPATCH_PARAMETERS);
   assert.deepEqual([...keys].sort(), [...WHITELIST_KEYS].sort(), '键集必须与白名单齐全');
   assert.equal(keys.length, WHITELIST_KEYS.length, '不得多出白名单外的字段');
-  assert.equal(keys.length, 15, '键集必须恰为 15 键（14 + 双名键 reasoning_effort）');
+  assert.equal(keys.length, 16, '键集必须恰为 16 键（15 + 双名键 reasoning_effort）');
   assert.ok(DISPATCH_PARAMETER_KEYS.includes('reasoning_effort'), '官方名必须进 DISPATCH_PARAMETER_KEYS（单一事实来源）');
   for (const key of keys) {
     assert.ok(WHITELIST_KEYS.includes(key), `字段 ${key} 必须在白名单内`);
@@ -245,4 +248,147 @@ test('F5：execute 层未知字段进入 decisionTrace.requested.unknown_keys（
     assert.deepEqual(out.decisionTrace.requested.unknown_keys, ['bogus', 'anotherUnknown'], '未知字段必须记录到决策轨迹');
     assert.equal(out.decisionTrace.requested.model, 'm1', '已知字段不受影响');
   } finally { iso.restore(); iso.teardown(); }
+});
+
+// ---- ⑥ strategy：schema 闭合 / 展开等价 / auto 解析链 -----------------------------
+
+test('strategy schema：auto 字符串或 7 键闭合对象，未知键被 additionalProperties:false 拒绝', () => {
+  const strategy = DISPATCH_PARAMETERS.strategy;
+  assert.equal(strategy.oneOf.length, 2, 'strategy 必须为 auto 字符串或对象二选一');
+  const autoBranch = strategy.oneOf.find((b) => b.type === 'string');
+  assert.deepEqual(autoBranch.enum, ['auto']);
+  const objBranch = strategy.oneOf.find((b) => b.type === 'object');
+  assert.equal(objBranch.additionalProperties, false, 'strategy 对象必须闭合，任何未知子键都被 schema 拒绝');
+  assert.deepEqual(
+    [...Object.keys(objBranch.properties)].sort(),
+    ['maxDepth', 'maxTokens', 'model', 'preset', 'provider', 'reasoning_effort', 'reasoningEffort', 'tokenTier'].sort(),
+    'strategy 对象键集恰为 7 策略字段（reasoning_effort 双名）'
+  );
+  assert.match(strategy.description, /方案 → 父级 → provider 默认/, 'strategy 描述必须写解析链');
+  assert.match(strategy.description, /顶层显式字段优先/, 'strategy 描述必须写顶层优先');
+});
+
+test('strategy 对象：未知键 fail-loud；非 auto/对象形态 fail-loud', () => {
+  assert.throws(
+    () => expandStrategy({ prompt: 't', strategy: { bogus: 1 } }, {}),
+    /strategy 含未知字段 "bogus"（仅接受 preset\/provider\/model\/reasoning_effort\/reasoningEffort\/tokenTier\/maxTokens\/maxDepth）/,
+    '未知键必须 fail-loud'
+  );
+  assert.throws(() => expandStrategy({ prompt: 't', strategy: 42 }, {}), /只接受字符串 "auto" 或 7 策略字段对象/);
+});
+
+test('strategy 展开等价：strategy:{model} 与顶层 model 同结果同轨迹，来源标记 strategy', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    let captured;
+    const subagentsStart = async (_provider, request) => {
+      captured = request;
+      return { result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }, dispose: async () => {} };
+    };
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const grouped = await tool.execute({ prompt: 'task', strategy: { model: 'm1' } }, { agent: makeForegroundParent(), signal: undefined });
+    const flat = await tool.execute({ prompt: 'task', model: 'm1' }, { agent: makeForegroundParent(), signal: undefined });
+    assert.equal(grouped.model, 'm1', '分组形态与顶层直传等价');
+    assert.equal(grouped.decisionTrace.effective.model, flat.decisionTrace.effective.model, '生效轨迹一致');
+    assert.equal(grouped.decisionTrace.requested.model, undefined, 'requested 快照保留原始请求（model 在 strategy 内）');
+    assert.deepEqual(grouped.decisionTrace.requested.strategy, { model: 'm1' }, 'requested 保留 strategy 原始值');
+    assert.equal(grouped.decisionTrace.requested.source, 'strategy', '来源标记 strategy');
+    assert.equal(flat.decisionTrace.requested.source, 'call', '顶层直传仍标记 call');
+    assert.equal(captured.profile.model, 'm1', '子请求配置携带展开后的 model');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('strategy 顶层优先：同送时顶层胜出不报错，来源标记 call', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    const subagentsStart = async () => ({
+      result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] },
+      dispose: async () => {},
+    });
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const out = await tool.execute(
+      { prompt: 'task', strategy: { model: 'm1', maxTokens: 8000 }, model: 'm2' },
+      { agent: makeForegroundParent(), signal: undefined }
+    );
+    assert.equal(out.model, 'm2', '顶层显式字段优先于 strategy');
+    assert.equal(out.decisionTrace.requested.source, 'call', '顶层显式指定模型 → call');
+    assert.deepEqual(out.decisionTrace.requested.strategy, { model: 'm1', maxTokens: 8000 }, 'strategy 原值保留在 requested');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('strategy auto 三态：方案有值取方案 / 无值取父 / 双无只记录 default', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    const subagentsStart = async () => ({
+      result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] },
+      dispose: async () => {},
+    });
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const service = records.provides.find((p) => p.name === 'subagent-profiles')?.service;
+    service.register({ id: 'auto-p', name: 'Auto', description: 'auto 解析链测试', model: 'm1', tokenTier: 'cheap' });
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const byProfile = await tool.execute(
+      { prompt: 'task', strategy: 'auto', profile: 'auto-p' },
+      { agent: makeForegroundParent(), signal: undefined }
+    );
+    assert.equal(byProfile.model, 'm1', '方案已配置 → 取方案值');
+    assert.equal(byProfile.decisionTrace.requested.strategy_resolution.model, 'profile', '解析链记录 profile');
+    assert.equal(byProfile.decisionTrace.requested.strategy_resolution.tokenTier, 'profile');
+    assert.equal(byProfile.decisionTrace.requested.source, 'auto', '来源标记 auto');
+    const byParent = await tool.execute(
+      { prompt: 'task', strategy: 'auto' },
+      { agent: { ...makeForegroundParent(), options: { provider: 'p1', model: 'm1' } }, signal: undefined }
+    );
+    assert.equal(byParent.model, 'm1', '方案未配置 → 继承父会话当前值');
+    assert.equal(byParent.decisionTrace.requested.strategy_resolution.model, 'parent', '解析链记录 parent');
+    const byDefault = await tool.execute(
+      { prompt: 'task', strategy: 'auto' },
+      { agent: makeForegroundParent(), signal: undefined }
+    );
+    assert.equal(byDefault.decisionTrace.requested.strategy_resolution.model, 'default', '双无 → 只记录 default 不产生覆盖');
+    assert.equal(byDefault.decisionTrace.requested.strategy_resolution.maxTokens, 'default');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('strategy 内双名：只送官方名归一为 camel；同送两义 fail-loud；顶层 snake 优先', () => {
+  const normalized = expandStrategy({ prompt: 't', strategy: { reasoning_effort: 'off' } }, {});
+  assert.equal(normalized.args.reasoningEffort, 'off', 'strategy 内官方名归一为 camel');
+  assert.equal(normalized.args.reasoning_effort, undefined);
+  assert.throws(
+    () => expandStrategy({ prompt: 't', strategy: { reasoning_effort: 'high', reasoningEffort: 'low' } }, {}),
+    /strategy 内 reasoning_effort 与 reasoningEffort 不得同送（两义即歧义，请二选一）/,
+    'strategy 内双名同送必须 fail-loud'
+  );
+  const topWins = expandStrategy({ prompt: 't', reasoning_effort: 'high', strategy: { reasoningEffort: 'low' } }, {});
+  assert.equal(topWins.args.reasoning_effort, 'high', '顶层官方名优先');
+  assert.equal(topWins.args.reasoningEffort, undefined, 'strategy 内值不覆盖顶层双名');
+});
+
+test('strategy 与既有闸联动：strategy.model 出官方模型白名单仍 fail-loud', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    const { ctx, records } = createFakeCtx();
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const projections = { stateOf: (_session, key) => (key === 'subagentModelSelectionPolicy' ? [{ provider: 'p1', model: 'm1' }] : undefined) };
+    const parent = { ctx: { get: (name) => (name === 'llm' ? makeLlm() : name === 'sessionProjections' ? projections : undefined), tools: { schemas: () => [{ name: 'read' }] } }, options: {}, session: { header: { id: 's-st' } } };
+    await assert.rejects(
+      () => tool.execute({ prompt: 'task', strategy: { provider: 'p2', model: 'm2' } }, { agent: parent, signal: undefined }),
+      /模型 p2\/m2 不在本会话允许的子代理模型白名单内/,
+      'strategy 展开后的 model 必须走既有官方模型闸'
+    );
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('effectiveModelSourceOf：strategy/auto 来源标记与顶层优先', () => {
+  assert.equal(effectiveModelSourceOf({ strategy: 'auto' }, {}, { options: {} }), 'auto');
+  assert.equal(effectiveModelSourceOf({ strategy: { model: 'm1' } }, {}, { options: {} }), 'strategy');
+  assert.equal(effectiveModelSourceOf({ strategy: { maxTokens: 8000 } }, {}, { options: {} }), 'default', '不含模型字段的 strategy 不决定路由');
+  assert.equal(effectiveModelSourceOf({ strategy: { model: 'm1' }, model: 'm2' }, {}, { options: {} }), 'call', '顶层显式字段优先于 strategy');
+  assert.equal(effectiveModelSourceOf({ strategy: 'auto', provider: 'p1' }, {}, { options: {} }), 'call', '顶层显式字段优先于 auto');
 });

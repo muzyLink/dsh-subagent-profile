@@ -7,6 +7,7 @@
 //     completed 结算写入 meta 且仅 completed 测量；tokenMeter 缺失省略字段
 //     （fail-soft，估算口径非计费）。
 //   * R1 三分支 output schema 同步携带 childTotalTokens + tokenTier。
+//   * 档位映射表 / 能力收敛 / 互锁四象限 / 派生注入标记 / continuable 派生分支。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +19,8 @@ import {
 } from '../lib/core/pure.mjs';
 import { settleStart } from '../lib/core/delegation.mjs';
 import { createFakeCtx, makeIsolatedDshHome } from './harness/ctx.mjs';
+import { TIER_DEFAULTS, deriveTierConfig, tierLockVerdictOf } from '../lib/core/tier-map.mjs';
+import { applyTierLockGate } from '../lib/core/dispatch-gates.mjs';
 
 const mod = await import('../index.mjs');
 
@@ -228,5 +231,201 @@ test('render 行：包含 tokenTier 与 childTotalTokens（供 client 解析回�
     const [block] = tool.output.render({}, value);
     assert.match(block.text, /tokenTier=cheap/);
     assert.match(block.text, /childTotalTokens=42/);
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+// ---- 档位映射表 / 能力收敛 / 互锁 ------------------------------------------------
+
+test('tier-map：TIER_DEFAULTS 三档默认表（effort + maxTokens）', () => {
+  assert.deepEqual(TIER_DEFAULTS.cheap, { reasoningEffort: 'off', maxTokens: 8000 });
+  assert.deepEqual(TIER_DEFAULTS.balanced, { reasoningEffort: 'high', maxTokens: 16000 });
+  assert.deepEqual(TIER_DEFAULTS.premium, { reasoningEffort: 'max', maxTokens: 32000 });
+});
+
+test('deriveTierConfig：efforts 能力收敛（官方档位序 off<low<high<max）', () => {
+  assert.deepEqual(deriveTierConfig('cheap', ['off', 'max']), { reasoningEffort: 'off', maxTokens: 8000 }, 'cheap 默认 off 受支持 → off');
+  assert.deepEqual(deriveTierConfig('balanced', ['off', 'max']), { reasoningEffort: 'max', maxTokens: 16000 }, '目标 high 不支持 → 取不低于目标档的最近档 max');
+  assert.deepEqual(deriveTierConfig('premium', ['off', 'max']), { reasoningEffort: 'max', maxTokens: 32000 });
+  assert.deepEqual(deriveTierConfig('cheap', ['low', 'high']), { reasoningEffort: 'low', maxTokens: 8000 }, '目标 off 不支持 → 不低于的最近档 low');
+  assert.deepEqual(deriveTierConfig('premium', ['low', 'high']), { reasoningEffort: 'high', maxTokens: 32000 }, '全部低于目标 max → 取最高可用档 high');
+  assert.deepEqual(deriveTierConfig('cheap', [{ id: 'off' }, { id: 'max' }]), { reasoningEffort: 'off', maxTokens: 8000 }, 'catalog 快照对象形状同样收敛');
+  assert.deepEqual(deriveTierConfig('cheap'), { reasoningEffort: 'off', maxTokens: 8000 }, '无 efforts 数据回退表值不判支持性');
+  assert.deepEqual(deriveTierConfig('unknown'), { reasoningEffort: 'high', maxTokens: 16000 }, '未知档位按 balanced 表值');
+});
+
+test('tier-lock 四象限：一致放行 / 更省放行 / 冲突 fail / 显式 maxTokens 超档位默认 fail', () => {
+  const pass = (merged) => { const v = tierLockVerdictOf(merged); assert.equal(v.check, true); assert.equal(v.allowed, true); };
+  const fail = (merged, field) => {
+    const v = tierLockVerdictOf(merged);
+    assert.equal(v.check, true);
+    assert.equal(v.allowed, false);
+    assert.ok(v.conflicts.some((c) => c.field === field), `冲突字段必须为 ${field}`);
+  };
+  pass({ tokenTier: 'cheap', reasoningEffort: 'off' }); // 一致放行
+  pass({ tokenTier: 'cheap', reasoningEffort: 'low' }); // 档位容量内放行
+  pass({ tokenTier: 'balanced', reasoningEffort: 'high' });
+  pass({ tokenTier: 'balanced', reasoningEffort: 'low' }); // 更省放行
+  pass({ tokenTier: 'premium', reasoningEffort: 'max' });
+  pass({ tokenTier: 'premium', reasoningEffort: 'low' }); // 显式降档放行
+  pass({ tokenTier: 'premium', reasoningEffort: 'off' });
+  fail({ tokenTier: 'cheap', reasoningEffort: 'high' }, 'reasoningEffort');
+  fail({ tokenTier: 'cheap', reasoningEffort: 'max' }, 'reasoningEffort');
+  fail({ tokenTier: 'balanced', reasoningEffort: 'max' }, 'reasoningEffort');
+  fail({ tokenTier: 'cheap', reasoningEffort: 'medium' }, 'reasoningEffort'); // 未知档按最高档保守判
+  pass({ tokenTier: 'cheap', maxTokens: 8000 }); // maxTokens 一致放行
+  pass({ tokenTier: 'cheap', maxTokens: 4000 }); // maxTokens 更省放行
+  pass({ tokenTier: 'premium', maxTokens: 32000 });
+  fail({ tokenTier: 'cheap', maxTokens: 8001 }, 'maxTokens');
+  fail({ tokenTier: 'premium', maxTokens: 40000 }, 'maxTokens');
+  assert.deepEqual(tierLockVerdictOf({}), { check: false }, '无档位不互锁');
+  assert.deepEqual(tierLockVerdictOf({ tokenTier: 'unknown' }), { check: false }, '非法档位不互锁');
+});
+
+test('applyTierLockGate：fail 前记 fail 闸并抛三层中文错误；pass 记 pass 闸；无档位不记', () => {
+  const deps = { logger: { warn: () => {} } };
+  const failTrace = { gates: [] };
+  assert.throws(
+    () => applyTierLockGate(failTrace, { tokenTier: 'cheap', reasoningEffort: 'high' }, {}, deps),
+    (err) => {
+      assert.match(err.message, /档位 cheap 与显式推理档 high 冲突/, '第一层：冲突事实');
+      assert.match(err.message, /档位是成本\/深度承诺，显式值与之矛盾/, '第二层：语义');
+      assert.match(err.message, /请改档位或改显式推理档/, '第三层：行动');
+      return true;
+    }
+  );
+  assert.equal(failTrace.gates.length, 1, 'fail 前先记闸条目');
+  assert.equal(failTrace.gates[0].name, 'tier-lock');
+  assert.equal(failTrace.gates[0].verdict, 'fail');
+  assert.equal(failTrace.gates[0].output.allowed, false);
+  assert.equal(failTrace.gates[0].input.tokenTier, 'cheap');
+  const tokenFailTrace = { gates: [] };
+  assert.throws(
+    () => applyTierLockGate(tokenFailTrace, { tokenTier: 'cheap', maxTokens: 9000 }, {}, deps),
+    /档位 cheap 的 token 预算承诺为 8000，显式 maxTokens=9000 超出承诺/,
+    'maxTokens 冲突必须给档位预算承诺文案'
+  );
+  assert.equal(tokenFailTrace.gates[0].verdict, 'fail');
+  const passTrace = { gates: [] };
+  applyTierLockGate(passTrace, { tokenTier: 'premium', reasoningEffort: 'low' }, {}, deps);
+  assert.equal(passTrace.gates[0].name, 'tier-lock');
+  assert.equal(passTrace.gates[0].verdict, 'pass');
+  const noTierTrace = { gates: [] };
+  applyTierLockGate(noTierTrace, { reasoningEffort: 'max' }, {}, deps);
+  assert.equal(noTierTrace.gates.length, 0, '无档位整体跳过，不记闸条目');
+});
+
+// ---- 派生注入（execute 层） ------------------------------------------------------
+
+// 提供能力面可核验的 llm：目录含 p1/m1、m2，resolveCallConfig 接受任意档位。
+function makeTierLlm() {
+  return {
+    listProviders: async () => [{ id: 'p1' }],
+    listModels: async () => [{ id: 'm1' }, { id: 'm2' }],
+    resolveModelInfo: async () => ({}),
+    resolveCallConfig: async () => ({}),
+  };
+}
+
+test('execute 档位派生：无显式 effort/maxTokens 时按档位注入子请求配置并记 derived 标记', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    let captured;
+    const subagentsStart = async (_provider, request) => {
+      captured = request;
+      return { result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }, dispose: async () => {} };
+    };
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const out = await tool.execute(
+      { prompt: 'task', tokenTier: 'cheap' },
+      { agent: makeForegroundParent(), signal: undefined }
+    );
+    assert.equal(captured.profile.reasoningEffort, 'off', '派生 effort 注入发往子请求的配置');
+    assert.equal(captured.profile.maxTokens, 8000, '派生 maxTokens 注入发往子请求的配置');
+    assert.equal(out.reasoningEffort, 'off', '生效元数据回显派生 effort');
+    assert.equal(out.decisionTrace.effective.reasoningEffortDerived, true, 'effort 派生标记');
+    assert.equal(out.decisionTrace.effective.maxTokensDerived, true, 'maxTokens 派生标记');
+    assert.ok(out.decisionTrace.gates.some((g) => g.name === 'tier-lock' && g.verdict === 'pass'), '互锁闸 pass 条目在轨迹中');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('execute 显式值优先：显式 effort/maxTokens 与档位一致时不被派生覆盖', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    let captured;
+    const subagentsStart = async (_provider, request) => {
+      captured = request;
+      return { result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }, dispose: async () => {} };
+    };
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const out = await tool.execute(
+      { prompt: 'task', tokenTier: 'cheap', reasoningEffort: 'low', maxTokens: 8000 },
+      { agent: { ctx: { get: (name) => (name === 'llm' ? makeTierLlm() : undefined) }, options: {} }, signal: undefined }
+    );
+    assert.equal(captured.profile.reasoningEffort, 'low', '显式 effort 恒优先');
+    assert.equal(captured.profile.maxTokens, 8000, '显式 maxTokens 恒优先');
+    assert.equal(out.decisionTrace.effective.reasoningEffortDerived, undefined, '显式 effort 不记派生标记');
+    assert.equal(out.decisionTrace.effective.maxTokensDerived, undefined, '显式 maxTokens 不记派生标记');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('execute 显式值越档：互锁闸在成本闸前 fail-loud（闸序）', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    const { ctx, records } = createFakeCtx();
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    await assert.rejects(
+      () => tool.execute(
+        { prompt: 'task', tokenTier: 'cheap', reasoningEffort: 'high' },
+        { agent: makeForegroundParent(), signal: undefined }
+      ),
+      /档位 cheap 与显式推理档 high 冲突/,
+      '显式值越档必须 fail-loud'
+    );
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('execute 无档位不派生：不带 tokenTier 的调用子请求配置与轨迹零变化', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    let captured;
+    const subagentsStart = async (_provider, request) => {
+      captured = request;
+      return { result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }, dispose: async () => {} };
+    };
+    const { ctx, records } = createFakeCtx({ subagentsStart });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const out = await tool.execute({ prompt: 'task' }, { agent: makeForegroundParent(), signal: undefined });
+    assert.equal(captured.profile.reasoningEffort, undefined, '无档位不派生 effort');
+    assert.equal(captured.profile.maxTokens, undefined, '无档位不派生 maxTokens');
+    assert.equal(out.reasoningEffort, '(default)', 'meta 保持旧版默认占位');
+    assert.equal(out.decisionTrace.effective.reasoningEffortDerived, undefined, '无派生标记');
+    assert.ok(!out.decisionTrace.gates.some((g) => g.name === 'tier-lock'), '无档位不记互锁闸');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('continuable 档位派生：派生 effort 忽略但 maxTokens 生效（agentOptions 断言）', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    let captured;
+    const startContinuable = async (opts) => { captured = opts; return { childId: 'child-tier' }; };
+    const { ctx, records } = createFakeCtx({ startContinuable });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const out = await tool.execute(
+      { prompt: 'task', continuable: true, tokenTier: 'cheap' },
+      { agent: { ctx: { get: () => undefined, tools: { schemas: () => [{ name: 'read' }, { name: 'write' }] } }, options: {} }, signal: undefined }
+    );
+    assert.equal(captured.request.agentOptions.maxTokens, 8000, '派生 maxTokens 进入 agentOptions');
+    assert.equal(captured.request.agentOptions.reasoningEffort, undefined, '派生 effort 不进 agentOptions（continuable 忽略）');
+    assert.equal(out.reasoningEffort, 'off', '结果回显派生档位');
+    assert.deepEqual(out.ignored, ['preset', 'reasoningEffort'], 'ignored 列出被丢弃项');
+    assert.equal(out.decisionTrace.effective.reasoningEffortDerived, true, '轨迹记录派生标记');
+    assert.equal(out.decisionTrace.effective.maxTokensDerived, true);
   } finally { iso.restore(); iso.teardown(); }
 });
