@@ -28,6 +28,9 @@ For [DeepSeek Harness](https://github.com/deepseek-ai/dsh) (DSH).
 | GUI management | ❌ | ✅ settings page + per-session ledger tab |
 | Performance-based suggestions | ❌ | ✅ confirm to apply, undo anytime |
 | Official model-selection interplay | ✅ enforced natively once enabled | ✅ dispatch follows the same whitelist (out-of-range routes are rejected) |
+| Strategy object & explicit auto | ❌ | ✅ `strategy` object / explicit `auto` resolution (scheme → parent → default) |
+| Inherited-change confirmation | ❌ | ✅ `confirm` gate: non-explicit model changes require explicit confirmation before dispatch |
+| Session dispatch budget | ❌ | ✅ configurable session budget (tokens & concurrency); dispatch stops with reminder at the cap |
 
 ## Installation
 
