@@ -2,7 +2,7 @@
 // 覆盖：
 //   * ① per-call 覆盖优先于 profile：profile 设 model='m1'、per-call 设 model='m2'
 //     → 前台 execute 结果与决策轨迹的 effective.model 均为 'm2'。
-//   * ② 未知字段拒绝：DISPATCH_PARAMETERS 键集恰为白名单 16 键（10 配置 + 2 模式 +
+//   * ② 未知字段拒绝：DISPATCH_PARAMETERS 键集恰为白名单 17 键（11 配置 + 2 模式 +
 //     profile/tokenTier/envelope/prompt + 双名键 reasoning_effort），toolFilter
 //     schema 闭合（additionalProperties:false，无未知键接受路径）。
 //   * ③ continuable 下 per-call reasoningEffort 忽略但回显请求值：结果
@@ -21,15 +21,15 @@ import { createFakeCtx, makeIsolatedDshHome } from './harness/ctx.mjs';
 
 const mod = await import('../index.mjs');
 
-// 白名单键集 = 10 配置（preset/model/provider/reasoningEffort/persona/toolFilter/
-// maxTokens/maxDepth + tokenTier 预算档 + strategy 策略对象）+ 2 模式
+// 白名单键集 = 11 配置（preset/model/provider/reasoningEffort/persona/toolFilter/
+// maxTokens/maxDepth + tokenTier 预算档 + strategy 策略对象 + confirm 确认开关）+ 2 模式
 // （run_in_background/continuable）+ profile（容器选择）/ envelope（模式）/
 // prompt（任务文本）+ 双名键 reasoning_effort（官方名，与 reasoningEffort 等效；
 // 归一化见 normalizeReasoningEffort）。键集断言以未列出的任一键都必须被拒绝的
 // 闭合口径为准。
 const WHITELIST_KEYS = [
   'profile', 'preset', 'model', 'provider', 'reasoningEffort', 'reasoning_effort', 'tokenTier',
-  'persona', 'toolFilter', 'maxTokens', 'maxDepth', 'strategy',
+  'persona', 'toolFilter', 'maxTokens', 'maxDepth', 'strategy', 'confirm',
   'run_in_background', 'continuable', 'envelope', 'prompt',
 ];
 
@@ -80,11 +80,11 @@ test('per-call 优先：profile model=m1，per-call model=m2 → effective.model
 
 // ---- ② 未知字段拒绝：白名单键集闭合 + toolFilter 闭合 ---------------------------
 
-test('参数 schema：键集恰为白名单 16 键（含双名键 reasoning_effort，无未知字段接受路径）', () => {
+test('参数 schema：键集恰为白名单 17 键（含双名键 reasoning_effort，无未知字段接受路径）', () => {
   const keys = Object.keys(DISPATCH_PARAMETERS);
   assert.deepEqual([...keys].sort(), [...WHITELIST_KEYS].sort(), '键集必须与白名单齐全');
   assert.equal(keys.length, WHITELIST_KEYS.length, '不得多出白名单外的字段');
-  assert.equal(keys.length, 16, '键集必须恰为 16 键（15 + 双名键 reasoning_effort）');
+  assert.equal(keys.length, 17, '键集必须恰为 17 键（16 + 双名键 reasoning_effort）');
   assert.ok(DISPATCH_PARAMETER_KEYS.includes('reasoning_effort'), '官方名必须进 DISPATCH_PARAMETER_KEYS（单一事实来源）');
   for (const key of keys) {
     assert.ok(WHITELIST_KEYS.includes(key), `字段 ${key} 必须在白名单内`);
