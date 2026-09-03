@@ -117,7 +117,7 @@ test('dispatch:budget section：orchestrator-v2 + sessionId → 三态文案（�
     await mod.apply(ctx);
     const budget = records.sectionCalls.find((s) => s.name === 'dispatch:budget');
     const text = budget.text({ agent: { ctx: {}, session: { header: { id: 's1' } } } });
-    assert.equal(text, '派发预算：充足（剩余 200000 token / 上限 200000）');
+    assert.equal(text, '派发预算：充足（剩余 500000 token / 上限 500000）');
     assert.equal(budget.text({ agent: { ctx: {} } }), '', '无父 sessionId 不注入');
   } finally { iso.restore(); iso.teardown(); }
 });

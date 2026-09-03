@@ -48,6 +48,17 @@ function syncBundledPresetsToHome(ctx) {
 
 // 卸载清理与启动清理辅助驻留 lib/core/cleanup.mjs（装配文件行门）。
 
+// 未采纳提醒 mint：判定时刻该父会话预算已耗尽（累计 >= 上限）则按预算中止
+// 归因（cause=budget-limit 带数值），否则走常规未采纳文案；快照读取失败恒按常规。
+function mintUnadoptedWithCause(guard, reminderStore, evoLedger, rec) {
+  const snapshot = guard.snapshot(rec.parentSessionId);
+  const budgetLimited = Number.isFinite(snapshot.maxParentTokens) && snapshot.maxParentTokens > 0
+    && Number.isFinite(snapshot.tokens) && snapshot.tokens >= snapshot.maxParentTokens;
+  return mintUnadoptedReminder(reminderStore, evoLedger, budgetLimited
+    ? { ...rec, cause: 'budget-limit', tokens: snapshot.tokens, limit: snapshot.maxParentTokens }
+    : rec);
+}
+
 // parent_adopted 装配：tracker 工厂 + 根 ctx 订阅 session/event（按 session.id 过滤），
 // 卸载退订并清理定时器。onDecision 经 getRefreshAdvice 延迟读取（先判定后聚合时为空
 // 操作）；onDecided 把「明确未采纳」转成提醒中心条目（同源审计 + 注意级提醒）。
@@ -77,7 +88,7 @@ function registerTeardown(ctx, dispatch, profilesQuery, ledger, guard, home, bac
   });
   const onAgentDisposed = ({ agent }) => {
     const parentSessionId = agent?.session?.header?.id;
-    if (parentSessionId !== undefined && parentSessionId !== null && parentSessionId !== '') { guard.resetParent(parentSessionId); adoptionTracker.parentDisposed(parentSessionId); }
+    if (parentSessionId !== undefined && parentSessionId !== null && parentSessionId !== '') { adoptionTracker.parentDisposed(parentSessionId); guard.resetParent(parentSessionId); }
   };
   ctx.on('agent/disposed', onAgentDisposed);
   ctx.effect(() => () => ctx.off('agent/disposed', onAgentDisposed));
@@ -222,7 +233,7 @@ function registerSystemPromptSections(ctx, store, getEnabled, getEvolutionAdvice
 // webServer 可选——无头部署保留 dispatch 工具、只丢设置页。webServer 的激活
 // （listen）是异步的，可能晚于本插件 inject 依赖解析完成，故在等它的 inject
 // 子 scope 内注册（apply 时 ctx.get 会读到 undefined）。
-function registerSettingsRoutes(ctx, store, getEnabled, setEnabled, syncTool, catalog, ledger, backgroundLedger, draftsStore, applyDraft, getAudit, getEvolutionAdvice, setEvolutionAdvice, getEscapeEnabled, setEscapeEnabled, escape, refreshAdvice, summariesFile, dispatchFile, adviceWhitelist, previewDraft, reminderStore, adviceSource, evolution, snapshots, recordAudit) {
+function registerSettingsRoutes(ctx, store, getEnabled, setEnabled, syncTool, catalog, ledger, backgroundLedger, draftsStore, applyDraft, getAudit, getEvolutionAdvice, setEvolutionAdvice, getEscapeEnabled, setEscapeEnabled, escape, refreshAdvice, summariesFile, dispatchFile, adviceWhitelist, previewDraft, reminderStore, adviceSource, evolution, snapshots, recordAudit, guard) {
   ctx.inject(['webServer'], (scope) => {
     scope.effect(createHttpRoutes({
       webServer: scope.webServer,
@@ -252,6 +263,7 @@ function registerSettingsRoutes(ctx, store, getEnabled, setEnabled, syncTool, ca
       snapshots,
       recordAudit,
       logger: ctx.logger,
+      guard,
     }), 'dsh-subagent-profile: settings routes');
   });
 }
@@ -299,7 +311,7 @@ function setupEscape(ctx, store, evoLedger, home, getReminderStore) {
 
 // `dispatch` 工具装配（defineTool + execute + syncTool）。须在 HTTP inject 之前
 // 构造，使 createHttpRoutes 能拿 dispatch.syncTool 供 /set-enabled 注册/注销。
-function createDispatch(ctx, store, catalog, ledger, guard, evoLedger, backgroundLedger, adoptionTracker, getEscapeSet, getEnabled, getEvolutionAdvice, snapshots) {
+function createDispatch(ctx, store, catalog, ledger, guard, evoLedger, backgroundLedger, adoptionTracker, getEscapeSet, getEnabled, getEvolutionAdvice, snapshots, getReminderStore) {
   return createDispatchTool({
     register: (tool) => ctx.tools.register(tool),
     store,
@@ -316,6 +328,7 @@ function createDispatch(ctx, store, catalog, ledger, guard, evoLedger, backgroun
     getEscapeSet,
     getEvolutionAdvice,
     snapshots,
+    getReminderStore,
   });
 }
 
@@ -360,14 +373,14 @@ export async function apply(ctx) {
   syncBundledPresetsToHome(ctx);
   const catalog = createSharedCatalog(ctx);
   const ledger = createFailureLedger({ warn: (message) => ctx.logger.warn(`[dsh-subagent-profile] ${message}`), stateFile: join(home, 'subagent-profiles.failed-traces.json') });
-  const guard = createDispatchGuard({ warn: (message) => ctx.logger.warn(`[dsh-subagent-profile] ${message}`) });
+  const guard = createDispatchGuard({ ...store.loadDispatchBudget(), warn: (message) => ctx.logger.warn(`[dsh-subagent-profile] ${message}`) });
   const backgroundLedger = createBackgroundLedger({ warn: (message) => ctx.logger.warn(`[dsh-subagent-profile] ${message}`) });
   const draftsStore = createDraftsStore({ dshHome: home, onGovernanceFailure: () => evoLedger.markGovernanceFailure() });
   reminderStore = createReminderStore({ dshHome: home, audit: (entry) => evoLedger.recordGovernanceAudit(entry), warn: (message) => ctx.logger.warn(`[dsh-subagent-profile] ${message}`) });
   // 配置快照域：开关关恒跳过（store.loadSnapshotEnabled 默认关）；写审计与治理失败同源。
   const snapshots = createSnapshotStore({ dshHome: home, logger: ctx.logger, getEnabled: () => store.loadSnapshotEnabled(), recordAudit: (entry) => evoLedger.recordGovernanceAudit(entry), onGovernanceFailure: () => evoLedger.markGovernanceFailure() });
-  let refreshAdvice = () => {}; const adoptionTracker = setupAdoptionTracker(ctx, home, () => refreshAdvice, (rec) => mintUnadoptedReminder(reminderStore, evoLedger, rec));
-  const dispatch = createDispatch(ctx, store, catalog, ledger, guard, evoLedger, backgroundLedger, adoptionTracker, escapeCtl.getEscapeSet, () => enabled, () => evolutionAdvice, snapshots);
+  let refreshAdvice = () => {}; const adoptionTracker = setupAdoptionTracker(ctx, home, () => refreshAdvice, (rec) => mintUnadoptedWithCause(guard, reminderStore, evoLedger, rec));
+  const dispatch = createDispatch(ctx, store, catalog, ledger, guard, evoLedger, backgroundLedger, adoptionTracker, escapeCtl.getEscapeSet, () => enabled, () => evolutionAdvice, snapshots, () => reminderStore);
   provideProfileService(ctx, store);
   const { adviceEnv, adviceSource, evolution } = await setupEvolution(ctx, home, store, catalog, evoLedger, () => evolutionAdvice, () => reminderStore);
   const profilesQuery = createProfilesQuery(ctx, store, catalog, adviceEnv, () => enabled);
@@ -391,6 +404,6 @@ export async function apply(ctx) {
       source: body !== null && typeof body === 'object' && typeof body.source === 'string' ? body.source : 'human',
     },
   });
-  registerSettingsRoutes(ctx, store, () => enabled, (next) => { enabled = next; }, syncTools, catalog, ledger, backgroundLedger, draftsStore, applyDraft, () => evoLedger.auditState(), () => evolutionAdvice, (next) => { evolutionAdvice = next; }, escapeCtl.getEscapeEnabled, escapeCtl.setEscapeEnabled, escapeCtl.escape, refreshAdvice, join(home, 'subagent-evolution', 'summaries.json'), adviceEnv.dispatchFile, adviceEnv.whitelist, previewDraft, reminderStore, adviceSource, evolution, snapshots, (entry) => evoLedger.recordGovernanceAudit(entry));
+  registerSettingsRoutes(ctx, store, () => enabled, (next) => { enabled = next; }, syncTools, catalog, ledger, backgroundLedger, draftsStore, applyDraft, () => evoLedger.auditState(), () => evolutionAdvice, (next) => { evolutionAdvice = next; }, escapeCtl.getEscapeEnabled, escapeCtl.setEscapeEnabled, escapeCtl.escape, refreshAdvice, join(home, 'subagent-evolution', 'summaries.json'), adviceEnv.dispatchFile, adviceEnv.whitelist, previewDraft, reminderStore, adviceSource, evolution, snapshots, (entry) => evoLedger.recordGovernanceAudit(entry), guard);
   registerTeardown(ctx, dispatch, profilesQuery, ledger, guard, home, backgroundLedger, adoptionTracker);
 }

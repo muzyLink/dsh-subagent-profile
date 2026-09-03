@@ -198,16 +198,16 @@ test('execute 并发：8 在途时第 9 个拒绝，全部完成后可再派发�
 test('execute token 超限：累计达标后拒绝新派发（前台结算记账）', async () => {
   const iso = makeIsolatedDshHome();
   try {
-    const tokenMeter = { measure: () => ({ totalTokens: 300000 }) };
+    const tokenMeter = { measure: () => ({ totalTokens: 600000 }) };
     const { ctx, records } = createFakeCtx({ subagentsStart: makeCompletedStart('child-t1'), services: { tokenMeter } });
     await mod.apply(ctx);
     const tool = dispatchTool(records);
     const parent = makeParent('parent-tokens');
     const out = await tool.execute({ prompt: 'task' }, { agent: parent, signal: undefined });
-    assert.equal(out.childTotalTokens, 300000);
+    assert.equal(out.childTotalTokens, 600000);
     await assert.rejects(
       () => tool.execute({ prompt: 'task 2', tokenTier: 'cheap' }, { agent: parent, signal: undefined }),
-      /累计派发 token 已达上限 200000/
+      /累计派发 token 已达上限 500000/
     );
   } finally { iso.restore(); iso.teardown(); }
 });
@@ -229,7 +229,7 @@ test('execute 前台完成不泄漏：连续两次派发都成功（释放并发
 test('execute 后台结算记账：onSettled 释放 + recordTokens（超限后拒）', async () => {
   const iso = makeIsolatedDshHome();
   try {
-    const tokenMeter = { measure: () => ({ totalTokens: 300000 }) };
+    const tokenMeter = { measure: () => ({ totalTokens: 600000 }) };
     let captured;
     const jobs = {
       start(spec) { captured = spec.run(); return 'job-1'; },
@@ -244,11 +244,11 @@ test('execute 后台结算记账：onSettled 释放 + recordTokens（超限后�
     assert.equal(out.jobId, 'job-1');
     const settled = await captured.done;
     assert.equal(settled.status, 'completed');
-    assert.equal(settled.childTotalTokens, 300000);
+    assert.equal(settled.childTotalTokens, 600000);
     // 结算后累计 token 已达标 → 下次派发拒绝（证明 onSettled 记账 + 释放）。
     await assert.rejects(
       () => tool.execute({ prompt: 'task 2', tokenTier: 'cheap' }, { agent: parent, signal: undefined }),
-      /累计派发 token 已达上限 200000/
+      /累计派发 token 已达上限 500000/
     );
   } finally { iso.restore(); iso.teardown(); }
 });
@@ -400,11 +400,11 @@ test('execute 后台 jobs 缺失：并发槽不泄漏（catch 幂等 release，8
 test('execute agent/disposed：父会话结束时按父释放记账（token 超限后可再派发）', async () => {
   const iso = makeIsolatedDshHome();
   try {
-    const tokenMeter = { measure: () => ({ totalTokens: 400000 }) };
+    const tokenMeter = { measure: () => ({ totalTokens: 600000 }) };
     const { ctx, records } = createFakeCtx({ subagentsStart: makeCompletedStart('child-d'), services: { tokenMeter } });
     await mod.apply(ctx);
     const tool = dispatchTool(records);
-    // 第一次派发结算 400000 token → 超过 200000 上限 → 后续被拒。
+    // 第一次派发结算 600000 token → 超过 500000 上限 → 后续被拒。
     const first = await tool.execute({ prompt: 'x' }, { agent: makeParent('parent-d'), signal: undefined });
     assert.equal(first.stopReason, 'completed');
     await assert.rejects(
