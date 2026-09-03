@@ -8,10 +8,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createDispatchGuard } from '../lib/core/dispatch-guard.mjs';
-import { applyBudgetGate } from '../lib/core/dispatch-gates.mjs';
+import { applyBudgetGate, usageTotalOf } from '../lib/core/dispatch-gates.mjs';
+import { collectChildUsage } from '../lib/core/delegation.mjs';
 import { mintUnadoptedReminder } from '../lib/core/adoption-reminder.mjs';
 import { createProfileStore } from '../lib/core/profiles-store.mjs';
 import { createFakeCtx, makeIsolatedDshHome } from './harness/ctx.mjs';
@@ -222,4 +224,119 @@ test('execute 预算中止：提醒中心出现 dispatch-budget-limit 条目', a
     assert.equal(found.title, '派发被预算上限中止');
     assert.match(found.detail, /本会话累计派发 token 已达上限 500000（当前 600000）/);
   } finally { iso.restore(); iso.teardown(); }
+});
+
+// --- 预算记账 = 真实计费五段和（预算与结算统一口径）-------------------------------
+
+test('usageTotalOf：input+cacheRead+cacheWrite+output 四段求和，reasoningTokens 不计，坏输入回退 undefined', () => {
+  assert.equal(usageTotalOf({ inputTokens: 1000, outputTokens: 500, cacheReadTokens: 300, cacheWriteTokens: 200, reasoningTokens: 999 }), 2000, '四段相加、推理段不计入');
+  assert.equal(usageTotalOf({ inputTokens: 1000, outputTokens: 500 }), 1500, '可选字段缺失按 0 累加');
+  assert.equal(usageTotalOf({ reasoningTokens: 999 }), undefined, '仅推理段无有效计费段 → 回退估算');
+  assert.equal(usageTotalOf(null), undefined);
+  assert.equal(usageTotalOf('x'), undefined);
+  assert.equal(usageTotalOf([1]), undefined);
+  assert.equal(usageTotalOf({ inputTokens: -1, outputTokens: 'x' }), undefined, '非法段一律忽略');
+});
+
+test('applyBudgetGate finish：记账累计 = 真实五段和（recordTokens 收到同源值）', () => {
+  const guard = createDispatchGuard();
+  const deps = makeGateDeps(guard, undefined);
+  const handle = applyBudgetGate(deps, PARENT, { prompt: 'x' }, { tokenTier: 'cheap' }, { gates: [] });
+  const usage = { inputTokens: 120000, outputTokens: 10000, cacheReadTokens: 80000, cacheWriteTokens: 90000, reasoningTokens: 60000 };
+  handle.finish('k', usageTotalOf(usage));
+  assert.equal(guard.snapshot('s1').tokens, 300000, '预算累计 = 真实四段和（不含推理段）');
+});
+
+test('同源断言：usageTotalOf 与 collectChildUsage 读同一事件流，四段和与官方口径一致', () => {
+  const session = { events: [
+    { type: 'assistant/message', data: { usage: { inputTokens: 40000, outputTokens: 3000, cacheReadTokens: 50000, cacheWriteTokens: 1000, reasoningTokens: 20000 } } },
+    { type: 'assistant/message', data: { usage: { inputTokens: 6000, outputTokens: 1000, cacheReadTokens: 0 } } },
+  ] };
+  const childUsage = collectChildUsage(session);
+  assert.deepEqual(childUsage, { inputTokens: 46000, outputTokens: 4000, cacheReadTokens: 50000, cacheWriteTokens: 1000, reasoningTokens: 20000 }, '事件流累加五段分解');
+  assert.equal(usageTotalOf(childUsage), 101000, '记账四段和 = 46000+4000+50000+1000');
+});
+
+test('e2e 前台：无 childUsage 回退估算记账（dispatch:budget 剩余量随估算值变化）', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    const tokenMeter = { measure: () => ({ totalTokens: 5000 }) };
+    const { ctx, records } = createFakeCtx({ subagentsStart: makeCompletedStart('child-fb'), services: { tokenMeter, agentPresets: { composedPreset: () => 'orchestrator-v2' } } });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const parent = { ctx: { get: () => undefined }, options: {}, session: { header: { id: 'parent-fb' } } };
+    const out = await tool.execute({ prompt: 'task', tokenTier: 'cheap' }, { agent: parent, signal: undefined });
+    assert.equal(out.stopReason, 'completed');
+    const budget = records.sectionCalls.find((s) => s.name === 'dispatch:budget');
+    const text = budget.text({ agent: { ctx: {}, session: { header: { id: 'parent-fb' } } } });
+    assert.equal(text, '派发预算：充足（剩余 495000 token / 上限 500000）', '无 usage 时回退 tokenMeter 估算 5000 记账');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+test('e2e 前台：预算闸按真实四段和触发（估算口径不再主导）', async () => {
+  const iso = makeIsolatedDshHome();
+  try {
+    writeFileSync(join(iso.dir, 'subagent-profiles.state.json'), JSON.stringify({ dispatchBudget: { maxParentTokens: 200000, maxConcurrent: 8 } }), 'utf8');
+    const tokenMeter = { measure: () => ({ totalTokens: 100 }) };
+    const usageEvents = [
+      { type: 'assistant/message', data: { usage: { inputTokens: 120000, outputTokens: 10000, cacheReadTokens: 80000, cacheWriteTokens: 90000, reasoningTokens: 60000 } } },
+    ];
+    const { webServer, routes } = makeRouteHarness();
+    const { ctx, records } = createFakeCtx({
+      subagentsStart: async () => ({ id: 'child-usage', result: { stopReason: 'completed', output: [{ type: 'text', text: 'ok' }] }, localAgent: { session: { events: usageEvents } }, dispose: async () => {} }),
+      services: { webServer, tokenMeter },
+    });
+    await mod.apply(ctx);
+    const tool = records.registerToolCalls.find((t) => t.name === 'dispatch');
+    const parent = { ctx: { get: () => undefined }, options: {}, session: { header: { id: 'parent-usage' } } };
+    const first = await tool.execute({ prompt: 'task', tokenTier: 'cheap' }, { agent: parent, signal: undefined });
+    assert.equal(first.stopReason, 'completed');
+    await assert.rejects(
+      () => tool.execute({ prompt: 'task 2', tokenTier: 'cheap' }, { agent: parent, signal: undefined }),
+      /累计派发 token 已达上限 200000/
+    );
+    const handler = routes[0].handler;
+    const resp = await callRoute(handler, 'GET', '/reminders');
+    const found = resp.json.reminders.find((r) => r.kind === 'dispatch-budget-limit');
+    assert.ok(found, '提醒中心必须有派发被预算上限中止条目');
+    assert.match(found.detail, /当前 300000/, '按真实四段和记账触发上限（估算 100 不会触发）');
+  } finally { iso.restore(); iso.teardown(); }
+});
+
+// --- 摘要行与预算卡文案（client 浏览器 bundle，源码结构断言）-----------------------
+
+const clientSource = readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8');
+
+function functionBody(name) {
+  const start = clientSource.indexOf('function ' + name);
+  assert.ok(start >= 0, '必须存在函数 ' + name);
+  const open = clientSource.indexOf('{', start);
+  let depth = 0;
+  for (let i = open; i < clientSource.length; i += 1) {
+    if (clientSource[i] === '{') depth += 1;
+    else if (clientSource[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return clientSource.slice(open, i + 1);
+    }
+  }
+  throw new Error('函数括号不平衡：' + name);
+}
+
+test('summaryNumbersOf：优先真实五段和（real:true），无 usage 回退估算（real:false）', () => {
+  const body = functionBody('summaryNumbersOf');
+  assert.ok(body.includes('usageFrom(result, block)'), '优先取 childUsage（与「缓存命中」同源）');
+  assert.ok(body.includes("['inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens']"), '四段求和键集与预算记账口径一致');
+  assert.ok(body.includes('return { tokens: sum, real: true }'), '真实和标记 real:true');
+  assert.ok(body.includes('childTotalTokens'), '无 usage 回退 childTotalTokens 估算');
+  assert.ok(body.includes('return { tokens, real: false }'), '估算回退标记 real:false');
+});
+
+test('dispatchSummaryText：≈ 依值源（真实值不带 ≈，估算回退仍带 ≈）', () => {
+  const body = functionBody('dispatchSummaryText');
+  assert.ok(body.includes("(numbers.real ? '' : '≈') + numbers.tokens + ' tokens'"), '摘要行 ≈ 前缀由 real 标记决定');
+});
+
+test('预算卡说明：追加「按子代理真实计费用量统计」，既有语义不删', () => {
+  assert.ok(clientSource.includes('本卡按子代理真实计费用量统计。'), '预算卡说明必须写明真实计费口径');
+  assert.ok(clientSource.includes('仅统计子代理消耗，不包含主会话自身用量。本卡按子代理真实计费用量统计。'), '既有说明逐字保留，只追加一句');
 });
