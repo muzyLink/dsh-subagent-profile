@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSnapshotStore, SNAPSHOT_CAP } from '../lib/core/snapshots.mjs';
 import { createFakeCtx, makeIsolatedDshHome } from './harness/ctx.mjs';
