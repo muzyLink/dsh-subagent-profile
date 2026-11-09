@@ -11,15 +11,19 @@
 #     裸环境装不到）；eslint 在仓库外隔离安装后链接进仓库，行门照跑。
 #
 # 启用前提：Gitea 服务器须安装并注册 Act runner（标签含 ubuntu-latest，支持
-# container 关键字）；就绪后本文件自动生效。详见 README「CI」一节。
+# container 关键字）。当前为手动触发——runner 就绪后恢复文件内的 push 过滤，
+# 并手动运行一次验证。详见 README「CI」一节。
 
 name: CI
 
 on:
-  push:
-    branches: [dev, main]
-  pull_request:
-    branches: [dev, main]
+  # 手动触发。推送自动触发暂缓：无 runner 时每次推送只会留下一个排队中的运行。
+  # 恢复时取消下面注释——branches 过滤对已有分支的更新生效，新建分支的首推会绕过它。
+  workflow_dispatch:
+  # push:
+  #   branches: [dev, main]
+  # pull_request:
+  #   branches: [dev, main]
 
 jobs:
   bare-ci:
