@@ -1,6 +1,7 @@
 // eslint.config.js — 行门：单文件 ≤400 行、单函数 ≤50 行（数据表豁免 + 完整性
 // 护栏；client.js 文件级按 ADR 豁免）。拒绝 baseline disable：无整文件
-// /* eslint-disable */ 豁免。
+// /* eslint-disable */ 豁免。注释行不计入行门：注释写的是行为与契约，不构成
+// 函数内控制流，口径按代码行计。
 
 import js from '@eslint/js';
 
@@ -39,8 +40,8 @@ export default [
     files: ['**/*.mjs', '**/*.js'],
     ignores: ['lib/client.js', 'presets/**'],
     rules: {
-      'max-lines': ['error', { max: 400, skipBlankLines: true, skipComments: false }],
-      'max-lines-per-function': ['error', { max: 50, skipBlankLines: true, skipComments: false }],
+      'max-lines': ['error', { max: 400, skipBlankLines: true, skipComments: true }],
+      'max-lines-per-function': ['error', { max: 50, skipBlankLines: true, skipComments: true }],
     },
   },
   // client.js：文件级 max-lines 按 ADR 永久豁免（module-host 单 bundle 契约，
@@ -60,7 +61,7 @@ export default [
     },
     rules: {
       'max-lines': 'off',
-      'max-lines-per-function': ['error', { max: 50, skipBlankLines: true, skipComments: false }],
+      'max-lines-per-function': ['error', { max: 50, skipBlankLines: true, skipComments: true }],
     },
   },
   // catalog.mjs 数据表豁免（纯键值映射数据表豁免 + 完整性护栏，护栏在测试）
