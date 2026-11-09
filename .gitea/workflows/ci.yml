@@ -12,7 +12,7 @@
 #
 # 启用前提：Gitea 服务器须安装并注册 Act runner（标签含 ubuntu-latest，支持
 # container 关键字）。当前为手动触发——runner 就绪后恢复文件内的 push 过滤，
-# 并手动运行一次验证。详见 README「CI」一节。
+# 并手动运行一次验证。详见 README「持续集成」一节。
 
 name: CI
 

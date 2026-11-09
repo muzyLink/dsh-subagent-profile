@@ -128,6 +128,14 @@ dsh-subagent-profile/
 └── docs/              # screenshots
 ```
 
+## Continuous integration
+
+The workflow lives in `.gitea/workflows/ci.yml`. It needs an act_runner registered on the Gitea server and assigned to this repository — without one, a queued run never starts.
+
+The pipeline runs `npm run test:bare`, `node --check` over every shipped module, `eslint . --max-warnings 0`, `npm run preflight`, and `npm run leak-scan`.
+
+It is triggered manually (`workflow_dispatch`). To restore push triggering, uncomment the `push` / `pull_request` block in the workflow file; branch filtering applies to updates of an existing branch, while the first push of a new branch bypasses it.
+
 ## Contributing
 
 Found a bug or have an idea? [Open an issue](https://github.com/muzyLink/dsh-subagent-profile/issues) or submit a pull request — all contributions are welcome.

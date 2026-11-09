@@ -128,6 +128,14 @@ dsh-subagent-profile/
 └── docs/              # 截图
 ```
 
+## 持续集成
+
+工作流在 `.gitea/workflows/ci.yml`。它需要 Gitea 服务器上注册并分配了 act_runner——没有 runner 时，排队的运行不会开始。
+
+流水线依次执行 `npm run test:bare`、对全部发布模块跑 `node --check`、`eslint . --max-warnings 0`、`npm run preflight`、`npm run leak-scan`。
+
+当前为手动触发（`workflow_dispatch`）。恢复推送触发时，取消工作流文件里 `push` / `pull_request` 块的注释；分支过滤对已有分支的更新生效，新建分支的首推会绕过它。
+
 ## 贡献
 
 发现 bug 或有想法？[提交 issue](https://github.com/muzyLink/dsh-subagent-profile/issues) 或 PR——欢迎一切贡献。
