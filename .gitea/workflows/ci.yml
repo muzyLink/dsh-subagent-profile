@@ -57,7 +57,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           ln -s /tmp/dsh-subagent-profile-eslint/node_modules node_modules
 
-      - name: Lint (行门: eslint . --max-warnings 0)
+      - name: Lint (行门 eslint . --max-warnings 0)
         run: node node_modules/eslint/bin/eslint.js . --max-warnings 0
 
       # preflight：preset 树对账（临时 DSH_HOME）+ README 徽章 == version；零依赖
